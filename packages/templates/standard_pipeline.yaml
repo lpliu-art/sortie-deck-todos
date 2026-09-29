@@ -1,0 +1,129 @@
+name: standard
+description: 标准轨 — PRD→设计→用例→开发→自测→联调→提测→测试→上线
+version: 2
+track: standard
+complexity: normal
+roles:
+  - id: product
+    title: Product Manager
+    persona: product
+    executor: mock_product
+  - id: design
+    title: Designer
+    persona: design
+    executor: mock_design
+  - id: eng
+    title: Engineer
+    persona: eng
+    executor: mock_eng
+  - id: eng_ios
+    title: iOS Engineer
+    persona: eng_ios
+    executor: mock_eng
+  - id: eng_android
+    title: Android Engineer
+    persona: eng_android
+    executor: mock_eng
+  - id: eng_web
+    title: Web Engineer
+    persona: eng_web
+    executor: mock_eng
+  - id: eng_backend
+    title: Backend Engineer
+    persona: eng_backend
+    executor: mock_eng
+  - id: eng_agent
+    title: Agent Engineer
+    persona: eng_agent
+    executor: mock_eng
+  - id: qa
+    title: QA
+    persona: qa
+    executor: mock_qa
+  - id: deploy
+    title: Deploy
+    persona: deploy
+    executor: mock_deploy
+stages:
+  - name: intake
+    role: product
+    label: 集结
+    label_en: Intake
+  - name: product_prd
+    role: product
+    label: PRD
+    label_en: PRD
+    hitl_after: true
+    on_reject: product_prd
+    output_contract:
+      - prd.md
+      - acceptance.json
+  - name: design_ui
+    role: design
+    label: 设计
+    label_en: Design
+    hitl_after: true
+    on_reject: design_ui
+    output_contract:
+      - design.md
+      - screens.json
+  - name: qa_cases
+    role: qa
+    label: 用例
+    label_en: Cases
+    hitl_after: true
+    on_reject: qa_cases
+    output_contract:
+      - test_plan.md
+      - test_cases.md
+  - name: eng_implement
+    role: eng
+    label: 开发
+    label_en: Build
+    output_contract:
+      - implementation.md
+      - tasks.json
+      - diff.patch
+  - name: eng_selftest
+    role: eng
+    label: 自测
+    label_en: Self-test
+    output_contract:
+      - selftest.md
+  - name: eng_integrate
+    role: eng
+    label: 联调
+    label_en: Integrate
+    output_contract:
+      - integrate.md
+  - name: qa_handoff
+    role: eng
+    label: 提测
+    label_en: Handoff
+    hitl_after: true
+    on_reject: eng_implement
+    output_contract:
+      - handoff.md
+  - name: qa_verify
+    role: qa
+    label: 测试
+    label_en: QA
+    hitl_after: true
+    on_fail: eng_implement
+    on_reject: eng_implement
+    output_contract:
+      - test_report.json
+      - test_cases.md
+  - name: deploy_preview
+    role: deploy
+    label: 上线
+    label_en: Ship
+    hitl_after: true
+    on_reject: deploy_preview
+    output_contract:
+      - deploy_plan.md
+      - deploy_result.json
+  - name: done
+    role: product
+    label: 完成
+    label_en: Done

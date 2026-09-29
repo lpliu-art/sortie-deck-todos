@@ -1,0 +1,110 @@
+site_name: Sortie Deck Docs
+site_description: AI-native office iteration control plane — architecture and module guides
+site_url: https://github.com/Truested-Dev-Teams/Truested-Dev-Teams
+repo_url: https://github.com/Truested-Dev-Teams/Truested-Dev-Teams
+repo_name: Truested-Dev-Teams
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  language: en
+  palette:
+    - scheme: slate
+      primary: teal
+      accent: lime
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+    - scheme: default
+      primary: teal
+      accent: lime
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - search.highlight
+    - content.code.copy
+    - content.action.edit
+
+plugins:
+  - search
+  - i18n:
+      docs_structure: folder
+      fallback_to_default: true
+      reconfigure_material: true
+      languages:
+        - locale: en
+          default: true
+          name: English
+          build: true
+        - locale: zh
+          name: 简体中文
+          build: true
+          nav_translations:
+            Home: 首页
+            Getting Started: 快速开始
+            Architecture: 架构
+            Overview: 总览
+            Data Flow: 数据流
+            Modules: 模块
+            Auth & RBAC: 认证与权限
+            Initiatives & Orchestrator: 任务与编排
+            Pipeline Planner: 航线规划
+            Graph HITL Contracts: 图·门禁·契约
+            Executors & Plugins: 执行器与插件
+            Squad Rooms: 小队频道
+            Knowledge Codex: 知识库 Codex
+            Memory: 记忆
+            Agent Forge: 角色工坊
+            Toolkit: 工具箱
+            Artifacts & Store: 产物与存储
+            Web Workbench: Web 工作台
+            CLI: 命令行
+            Roadmap: 路线图
+            Contributing: 贡献指南
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.highlight
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Getting Started: getting-started.md
+  - Architecture:
+      - Overview: architecture/overview.md
+      - Data Flow: architecture/data-flow.md
+  - Modules:
+      - Auth & RBAC: modules/auth.md
+      - Initiatives & Orchestrator: modules/orchestrator.md
+      - Pipeline Planner: modules/pipeline.md
+      - Graph HITL Contracts: modules/graph.md
+      - Executors & Plugins: modules/executors.md
+      - Squad Rooms: modules/rooms.md
+      - Knowledge Codex: modules/knowledge.md
+      - Memory: modules/memory.md
+      - Agent Forge: modules/agents.md
+      - Toolkit: modules/toolkit.md
+      - Artifacts & Store: modules/artifacts.md
+      - Web Workbench: modules/web.md
+      - CLI: modules/cli.md
+  - Roadmap: roadmap.md
+  - Contributing: contributing.md
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/Truested-Dev-Teams/Truested-Dev-Teams

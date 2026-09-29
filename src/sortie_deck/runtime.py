@@ -1,0 +1,139 @@
+from __future__ import annotations
+
+import logging
+import socket
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from sortie_deck.settings import Settings, settings
+
+
+@dataclass
+class DoctorCheck:
+    name: str
+    ok: bool
+    detail: str
+
+
+@dataclass
+class DoctorReport:
+    checks: list[DoctorCheck] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return all(c.ok for c in self.checks)
+
+
+def configure_logging(level: str = "INFO") -> None:
+    root = logging.getLogger()
+    if not root.handlers:
+        logging.basicConfig(
+            level=getattr(logging, level.upper(), logging.INFO),
+            format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        )
+    else:
+        root.setLevel(getattr(logging, level.upper(), logging.INFO))
+    # Avoid accidental token leaks from httpx/uvicorn access if misconfigured
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+def ensure_runtime_dirs(cfg: Settings | None = None) -> None:
+    cfg = cfg or settings
+    for path in (
+        cfg.data_dir,
+        cfg.artifacts_dir,
+        cfg.worktrees_dir,
+        cfg.rooms_dir,
+    ):
+        path.mkdir(parents=True, exist_ok=True)
+
+
+def validate_settings(cfg: Settings | None = None) -> None:
+    """Raise on unsafe production configuration."""
+    cfg = cfg or settings
+    # Forces production secret check
+    cfg.resolved_token_secret()
+    backend = (cfg.artifact_backend or "local").lower()
+    if backend in {"s3", "minio"} and not (cfg.s3_bucket or "").strip():
+        raise RuntimeError("TDT_S3_BUCKET required when TDT_ARTIFACT_BACKEND=s3")
+    if (cfg.run_backend or "").lower() == "sqlite":
+        cfg.runs_sqlite.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _port_free(host: str, port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.5)
+        return sock.connect_ex((host, port)) != 0
+
+
+def run_doctor(cfg: Settings | None = None) -> DoctorReport:
+    cfg = cfg or settings
+    report = DoctorReport()
+    try:
+        secret = cfg.resolved_token_secret()
+        weak = secret == "tdt-dev-secret"
+        report.checks.append(
+            DoctorCheck(
+                "token_secret",
+                ok=True,
+                detail=(
+                    "using development default secret"
+                    if weak
+                    else "custom TDT_TOKEN_SECRET set"
+                ),
+            )
+        )
+        if cfg.env.lower() == "production" and weak:
+            report.checks[-1] = DoctorCheck(
+                "token_secret", False, "production requires non-default TDT_TOKEN_SECRET"
+            )
+    except Exception as exc:  # noqa: BLE001
+        report.checks.append(DoctorCheck("token_secret", False, str(exc)))
+
+    data = Path(cfg.data_dir)
+    try:
+        data.mkdir(parents=True, exist_ok=True)
+        probe = data / ".write_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        report.checks.append(DoctorCheck("data_dir", True, f"writable: {data}"))
+    except Exception as exc:  # noqa: BLE001
+        report.checks.append(DoctorCheck("data_dir", False, str(exc)))
+
+    free = _port_free(cfg.host, cfg.port)
+    report.checks.append(
+        DoctorCheck(
+            "api_port",
+            free,
+            f"{cfg.host}:{cfg.port} {'available' if free else 'in use'}",
+        )
+    )
+
+    backend = (cfg.artifact_backend or "local").lower()
+    if backend in {"s3", "minio"}:
+        ok = bool(cfg.s3_bucket)
+        report.checks.append(
+            DoctorCheck(
+                "artifacts",
+                ok,
+                f"s3 bucket={'set' if ok else 'missing'}",
+            )
+        )
+    else:
+        report.checks.append(DoctorCheck("artifacts", True, f"local → {cfg.artifacts_dir}"))
+
+    report.checks.append(
+        DoctorCheck(
+            "run_backend",
+            True,
+            f"{cfg.run_backend} (worker={cfg.worker_id})",
+        )
+    )
+    report.checks.append(
+        DoctorCheck(
+            "storage",
+            True,
+            cfg.storage,
+        )
+    )
+    return report

@@ -1,0 +1,7 @@
+{
+  "default_track": "standard",
+  "allowed_tracks": ["express", "standard", "default"],
+  "allowed_toolkit_ids": [],
+  "deny_toolkit_import": false,
+  "notes": "Empty allowed_toolkit_ids means all toolkits are permitted. Restrict by listing ids."
+}

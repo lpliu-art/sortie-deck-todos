@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security report
+    url: https://github.com/Truested-Dev-Teams/Truested-Dev-Teams/security/advisories/new
+    about: Please do not file public issues for vulnerabilities — see SECURITY.md.
+  - name: Documentation
+    url: https://github.com/Truested-Dev-Teams/Truested-Dev-Teams#documentation
+    about: Architecture and per-module plans (MkDocs).

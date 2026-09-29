@@ -1,0 +1,20 @@
+[project]
+name = "sortie-demo-executor"
+version = "0.1.0"
+description = "Example Sortie Deck community executor via entry points"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.entry-points."sortie_deck.executors"]
+demo_echo = "demo_executor:build"
+
+# Legacy alias — still loaded by Sortie Deck
+[project.entry-points."rally.executors"]
+demo_echo = "demo_executor:build"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
