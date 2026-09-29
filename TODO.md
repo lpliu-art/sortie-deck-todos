@@ -239,15 +239,15 @@ LangGraph ── 仍负责边、波次、interrupt
 flowchart LR
   human[HumanInChannel]
   jev[JevDecision]
-  graph[LangGraphPipeline]
+  pipeline[LangGraphPipeline]
   agents[RoleExecutors]
   kb[KnowledgeTags]
   mem[MemoryScopes]
   human -->|confirm_or_policy| jev
-  jev -->|typed_choice| graph
-  graph --> agents
+  jev -->|typed_choice| pipeline
+  pipeline --> agents
   kb --> agents
   mem --> agents
-  graph -->|telemetry| evolve[SelfIteration]
+  pipeline -->|telemetry| evolve[SelfIteration]
   evolve --> jev
 ```
