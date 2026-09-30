@@ -7,6 +7,7 @@
 ## 从这里开始
 
 - [快速开始](getting-started.md) — 安装、启动 API 与工作台
+- [设计文档](design/index.md) — 目标、航线、HITL、威胁模型、ADR
 - [架构总览](architecture/overview.md) — 系统设计
 - [模块](modules/auth.md) — 分模块技术方案与实现计划
 - [路线图](roadmap.md) — 跨模块里程碑

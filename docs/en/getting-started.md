@@ -9,7 +9,7 @@
 ## Install
 
 ```bash
-cd Truested-Dev-Teams
+cd sortie-deck-todos
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"

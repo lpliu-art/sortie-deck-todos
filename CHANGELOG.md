@@ -37,5 +37,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CLI: `sortie smoke`, `sortie api`
 - Pluggable executors: mock, Claude Code, Cursor CLI, deploy shell
 
-[Unreleased]: https://github.com/Truested-Dev-Teams/Truested-Dev-Teams/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/Truested-Dev-Teams/Truested-Dev-Teams/releases/tag/v0.1.0
+[Unreleased]: https://github.com/lpliu-art/sortie-deck-todos/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/lpliu-art/sortie-deck-todos/releases/tag/v0.1.0

@@ -42,11 +42,11 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Truested-Dev-Teams/Truested-Dev-Teams"
-Documentation = "https://github.com/Truested-Dev-Teams/Truested-Dev-Teams#documentation"
-Repository = "https://github.com/Truested-Dev-Teams/Truested-Dev-Teams"
-Issues = "https://github.com/Truested-Dev-Teams/Truested-Dev-Teams/issues"
-Changelog = "https://github.com/Truested-Dev-Teams/Truested-Dev-Teams/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/lpliu-art/sortie-deck-todos"
+Documentation = "https://github.com/lpliu-art/sortie-deck-todos/blob/dev/DESIGN.md"
+Repository = "https://github.com/lpliu-art/sortie-deck-todos"
+Issues = "https://github.com/lpliu-art/sortie-deck-todos/issues"
+Changelog = "https://github.com/lpliu-art/sortie-deck-todos/blob/dev/CHANGELOG.md"
 
 [project.optional-dependencies]
 postgres = ["langgraph-checkpoint-postgres>=2.0.0", "psycopg[binary]>=3.2.0"]

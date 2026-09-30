@@ -1,9 +1,9 @@
 site_name: Sortie Deck Docs
-site_description: AI-native office iteration control plane — architecture and module guides
-site_url: https://github.com/Truested-Dev-Teams/Truested-Dev-Teams
-repo_url: https://github.com/Truested-Dev-Teams/Truested-Dev-Teams
-repo_name: Truested-Dev-Teams
-edit_uri: edit/main/docs/
+site_description: AI-native office iteration control plane — design, architecture, and module guides
+site_url: https://github.com/lpliu-art/sortie-deck-todos
+repo_url: https://github.com/lpliu-art/sortie-deck-todos
+repo_name: lpliu-art/sortie-deck-todos
+edit_uri: edit/dev/docs/
 
 theme:
   name: material
@@ -46,6 +46,12 @@ plugins:
           nav_translations:
             Home: 首页
             Getting Started: 快速开始
+            Design: 设计
+            Goals & Non-goals: 目标与非目标
+            Pipeline & Graph: 航线与图编排
+            Human-in-the-loop: 人在环
+            Threat Model: 威胁模型
+            ADRs: 架构决策
             Architecture: 架构
             Overview: 总览
             Data Flow: 数据流
@@ -84,6 +90,13 @@ markdown_extensions:
 nav:
   - Home: index.md
   - Getting Started: getting-started.md
+  - Design:
+      - Overview: design/index.md
+      - Goals & Non-goals: design/goals.md
+      - Pipeline & Graph: design/pipeline-and-graph.md
+      - Human-in-the-loop: design/human-in-the-loop.md
+      - Threat Model: design/threat-model.md
+      - ADRs: design/adr/index.md
   - Architecture:
       - Overview: architecture/overview.md
       - Data Flow: architecture/data-flow.md
@@ -107,4 +120,4 @@ nav:
 extra:
   social:
     - icon: fontawesome/brands/github
-      link: https://github.com/Truested-Dev-Teams/Truested-Dev-Teams
+      link: https://github.com/lpliu-art/sortie-deck-todos

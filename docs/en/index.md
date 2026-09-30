@@ -7,6 +7,7 @@ Use the language switcher in the header to toggle **English / 简体中文**.
 ## Start here
 
 - [Getting Started](getting-started.md) — install, run API + workbench
+- [Design](design/index.md) — goals, pipeline, HITL, threat model, ADRs
 - [Architecture Overview](architecture/overview.md) — system design
 - [Modules](modules/auth.md) — per-module tech specs and implementation plans
 - [Roadmap](roadmap.md) — cross-cutting milestones

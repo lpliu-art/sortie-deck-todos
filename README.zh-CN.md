@@ -60,8 +60,8 @@ flowchart TB
 ## 快速开始
 
 ```bash
-git clone <repo-url> Truested-Dev-Teams
-cd Truested-Dev-Teams
+git clone https://github.com/lpliu-art/sortie-deck-todos.git
+cd sortie-deck-todos
 python3 -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
@@ -168,10 +168,11 @@ mkdocs serve
 # → http://127.0.0.1:8000
 ```
 
-- English: `docs/en/`
-- 简体中文: `docs/zh/`
+- 设计索引：[`DESIGN.md`](DESIGN.md) · `docs/zh/design/` · `docs/en/design/`
+- 架构：[`ARCHITECTURE.md`](ARCHITECTURE.md)
+- 简体中文：`docs/zh/` · English：`docs/en/`
 
-另见：[贡献指南](CONTRIBUTING.md) · [安全](SECURITY.md) · [行为准则](CODE_OF_CONDUCT.md) · [变更日志](CHANGELOG.md)
+另见：[贡献指南](CONTRIBUTING.md) · [安全](SECURITY.md) · [行为准则](CODE_OF_CONDUCT.md) · [变更日志](CHANGELOG.md) · [TODO](TODO.md)
 
 ## 贡献
 

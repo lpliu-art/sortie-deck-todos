@@ -60,8 +60,8 @@ Full design, module specs, and roadmaps: see [Documentation](#documentation).
 ## Quick start
 
 ```bash
-git clone <repo-url> Truested-Dev-Teams
-cd Truested-Dev-Teams
+git clone https://github.com/lpliu-art/sortie-deck-todos.git
+cd sortie-deck-todos
 python3 -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
@@ -183,10 +183,11 @@ mkdocs serve
 # → http://127.0.0.1:8000
 ```
 
-- English: `docs/en/`
-- 简体中文: `docs/zh/`
+- Design index: [`DESIGN.md`](DESIGN.md) · `docs/en/design/` · `docs/zh/design/`
+- Architecture: [`ARCHITECTURE.md`](ARCHITECTURE.md)
+- English: `docs/en/` · 简体中文: `docs/zh/`
 
-Also: [CONTRIBUTING](CONTRIBUTING.md) · [SECURITY](SECURITY.md) · [CODE OF CONDUCT](CODE_OF_CONDUCT.md) · [CHANGELOG](CHANGELOG.md)
+Also: [CONTRIBUTING](CONTRIBUTING.md) · [SECURITY](SECURITY.md) · [CODE OF CONDUCT](CODE_OF_CONDUCT.md) · [CHANGELOG](CHANGELOG.md) · [TODO](TODO.md)
 
 ## Contributing
 

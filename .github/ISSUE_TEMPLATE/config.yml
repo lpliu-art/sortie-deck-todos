@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
   - name: Security report
-    url: https://github.com/Truested-Dev-Teams/Truested-Dev-Teams/security/advisories/new
+    url: https://github.com/lpliu-art/sortie-deck-todos/security/advisories/new
     about: Please do not file public issues for vulnerabilities — see SECURITY.md.
   - name: Documentation
-    url: https://github.com/Truested-Dev-Teams/Truested-Dev-Teams#documentation
-    about: Architecture and per-module plans (MkDocs).
+    url: https://github.com/lpliu-art/sortie-deck-todos/blob/dev/DESIGN.md
+    about: Design docs, architecture, and per-module plans (MkDocs).
