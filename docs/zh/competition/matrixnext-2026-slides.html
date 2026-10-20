@@ -234,7 +234,7 @@
       <div class="hero">
         <div class="eyebrow">MatrixNEXT 2026 · 创意赛道 · 流程自动驾驶</div>
         <h1>Sortie Deck</h1>
-        <p class="lead">AI 原生办公迭代控制面 —— 用可确认航线、产物契约与人在环，替代 IM 传话筒协作。</p>
+        <p class="lead">面向中大型产研团队的 AI 原生办公迭代控制面。可确认航线、产物契约与人在环，把传话成本换成可审计的出击。</p>
         <div class="pill-row">
           <span class="pill"><strong>队伍</strong> SortieDeck</span>
           <span class="pill"><strong>开源</strong> Apache-2.0</span>
@@ -247,7 +247,7 @@
     <section class="slide" data-title="问题">
       <div class="eyebrow">01 · 问题</div>
       <h2>我们已经有 AI，为什么协作还是乱的？</h2>
-      <p class="lead">总线仍是人和 IM：各自开聊天窗口、粘贴接力、截图当契约。</p>
+      <p class="lead">中大型产研已经人手一个 AI，总线仍是人和 IM：各自开窗口、粘贴接力、截图当契约。接力越长，迭代越慢，决策越难回放。</p>
       <div class="flow">
         <span>产品</span><i>→</i><span>AI</span><i>→</i><span>需求文档</span><i>→</i>
         <span>澄清会议</span><i>→</i><span>IM 传话</span><i>→</i>
@@ -307,12 +307,84 @@
             <td>群里 @ 一下</td>
             <td><code>LangGraph interrupt()</code> HITL（可恢复、可审计）</td>
           </tr>
+          <tr>
+            <td>上下文</td>
+            <td>粘贴锁在个人聊天里</td>
+            <td>全员同一 Brief、航线、产物与 HITL</td>
+          </tr>
         </tbody>
       </table>
     </section>
 
+    <section class="slide" data-title="商业价值">
+      <div class="eyebrow">04 · 商业价值</div>
+      <h2>少接力、快闭环、可审计、数据自持</h2>
+      <p class="lead">面向中大型产品与工程团队的定性结果，不是客户案例，也不是实测数字。</p>
+      <div class="grid2">
+        <div class="card">
+          <h3>降低接力成本</h3>
+          <p>产品、工程、测试、发布沿同一条出击交接，不再把需求誊进各自的聊天窗口。</p>
+        </div>
+        <div class="card">
+          <h3>加快迭代闭环</h3>
+          <p>航线确认后按阶段推进。并行波次对齐命名产物，不再干等群里对齐口径。</p>
+        </div>
+        <div class="card">
+          <h3>合规可回放</h3>
+          <p>谁确认了航线、哪一关放行或打回、产物写在哪条路径，都留在控制面上。</p>
+        </div>
+        <div class="card">
+          <h3>开源，可本地部署</h3>
+          <p>Apache-2.0。控制面、产物与知识可留在自有环境，出击上下文由团队自己掌管。</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="slide" data-title="上下文平权">
+      <div class="eyebrow">05 · 上下文平权</div>
+      <h2>出击上的每个角色，读同一份真相</h2>
+      <p class="lead">产品、工程、测试、发布共享同一份 Brief、已确认航线、命名产物和 HITL 决策。没有只活在某一次私人对话里的特权粘贴。</p>
+      <div class="pill-row">
+        <span class="pill"><strong>产品</strong> 同一 Brief</span>
+        <span class="pill"><strong>工程</strong> 同一航线</span>
+        <span class="pill"><strong>测试</strong> 同一产物</span>
+        <span class="pill"><strong>发布</strong> 同一 HITL</span>
+      </div>
+      <div class="grid2">
+        <div class="card">
+          <h3>角色之间拉平</h3>
+          <p>下游读命名文件。上下文属于这次出击，不属于最后粘贴的那个人。</p>
+        </div>
+        <div class="card">
+          <h3>知识与记忆按作用域到达</h3>
+          <p>工作区、任务、角色作用域把该知道的上下文注入执行中的 Agent。阶段标签挡住并行分支串味，避免结论只留在某一个聊天记录里。</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="slide" data-title="沟通协作">
+      <div class="eyebrow">06 · 沟通协作</div>
+      <h2>频道看得见，门禁说了算</h2>
+      <p class="lead">小队频道是可见协作层。真相在航线、产物和 HITL。点名与斜杠命令是结构化操作，群里随手 @ 不再充当审批。</p>
+      <div class="flow">
+        <span>@product</span><i>·</i><span>@eng</span><i>·</i><span>@qa</span><i>·</i><span>@deploy</span>
+        <i>→</i>
+        <span>/confirm</span><i>·</i><span>/start</span><i>·</i><span>/approve</span><i>·</i><span>/rewrite</span><i>·</i><span>/stop</span>
+      </div>
+      <div class="grid2">
+        <div class="card">
+          <h3>协作发生在明处</h3>
+          <p>讨论、阶段消息和决策留在任务频道里，全员可见。IM 可以做通知，不能当真相源。</p>
+        </div>
+        <div class="card">
+          <h3>HITL 是一等门禁</h3>
+          <p><code>interrupt()</code> 暂停图。放行、打回、改写、停止、重路由回到同一条可恢复轨迹，并可以审计。</p>
+        </div>
+      </div>
+    </section>
+
     <section class="slide" data-title="创新点">
-      <div class="eyebrow">04 · 创新点</div>
+      <div class="eyebrow">07 · 创新点</div>
       <h2>为什么不是「又一个 Agent 聊天」</h2>
       <div class="grid2">
         <div class="card">
@@ -335,7 +407,7 @@
     </section>
 
     <section class="slide" data-title="技术栈">
-      <div class="eyebrow">05 · 技术栈</div>
+      <div class="eyebrow">08 · 技术栈</div>
       <h2>可运行、可插拔、可本地部署</h2>
       <div class="grid2">
         <div class="card">
@@ -362,7 +434,7 @@
     </section>
 
     <section class="slide" data-title="演示">
-      <div class="eyebrow">06 · 演示路径</div>
+      <div class="eyebrow">09 · 演示路径</div>
       <h2>一条完整出击（可剪成 ≤3 分钟视频）</h2>
       <div class="grid2">
         <div class="card">
@@ -390,7 +462,8 @@
       <div class="hero">
         <div class="eyebrow">MatrixNEXT 2026</div>
         <h1>让 Agent 接手流程，<br />让人守住出击权。</h1>
-        <p class="big-quote">Sortie Deck —— 办公迭代的控制面，而不是又一个聊天框。</p>
+        <p class="big-quote">同一份 Brief，同一条航线，每一次放行都留在控制面上。</p>
+        <p class="lead">Sortie Deck —— 少接力、上下文平权、协作可审计。办公迭代的控制面，而不是又一个聊天框。</p>
         <div class="pill-row">
           <span class="pill">创意赛道 · 流程自动驾驶</span>
           <span class="pill">SortieDeck</span>
@@ -401,7 +474,7 @@
   </div>
 
   <div class="footer-bar">
-    <span id="label">1 / 8 · 封面</span>
+    <span id="label">1 / 11 · 封面</span>
     <div class="nav">
       <button type="button" id="prev">← 上一页</button>
       <button type="button" id="next">下一页 →</button>
