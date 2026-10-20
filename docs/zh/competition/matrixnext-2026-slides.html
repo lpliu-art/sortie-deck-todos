@@ -19,204 +19,441 @@
     html, body {
       margin: 0;
       height: 100%;
-      background: var(--bg);
       color: var(--text);
       font-family: "PingFang SC", "Hiragino Sans GB", "Noto Sans SC",
         "Segoe UI", system-ui, sans-serif;
+      background:
+        radial-gradient(880px 380px at 8% -12%, rgba(61,255,168,0.10), transparent 58%),
+        radial-gradient(720px 320px at 100% 0%, rgba(110,200,255,0.09), transparent 52%),
+        linear-gradient(rgba(42,56,72,0.45) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(42,56,72,0.45) 1px, transparent 1px),
+        var(--bg);
+      background-size: auto, auto, 42px 42px, 42px 42px, auto;
     }
-    .deck {
-      height: 100%;
-      overflow: hidden;
-      position: relative;
-    }
+    .deck { height: 100%; overflow: hidden; position: relative; }
     .slide {
       display: none;
       height: 100%;
-      padding: clamp(1.2rem, 3vw, 2.4rem) clamp(1.4rem, 4vw, 3.2rem) 4.2rem;
+      padding: clamp(0.55rem, 1.3vw, 0.85rem) clamp(0.8rem, 2vw, 1.45rem) 2.7rem;
       flex-direction: column;
-      gap: 0.9rem;
-      background:
-        radial-gradient(1000px 500px at 10% -10%, rgba(61,255,168,0.08), transparent 55%),
-        radial-gradient(800px 400px at 100% 0%, rgba(110,200,255,0.08), transparent 50%),
-        var(--bg);
+      gap: 0.45rem;
     }
-    .slide.on { display: flex; }
-    .eyebrow {
+    .slide.on {
+      display: flex;
+      animation: deck-in 0.4s cubic-bezier(.16,.84,.32,1) both;
+    }
+    .slide.on.from-left { animation-name: deck-in-left; }
+    @keyframes deck-in {
+      from { opacity: 0; transform: translateX(22px); }
+      to { opacity: 1; transform: none; }
+    }
+    @keyframes deck-in-left {
+      from { opacity: 0; transform: translateX(-22px); }
+      to { opacity: 1; transform: none; }
+    }
+    @keyframes rise {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: none; }
+    }
+    .slide.on .stagger > * { animation: rise 0.4s cubic-bezier(.16,.84,.32,1) both; }
+    .slide.on .stagger > *:nth-child(1) { animation-delay: 0.04s; }
+    .slide.on .stagger > *:nth-child(2) { animation-delay: 0.08s; }
+    .slide.on .stagger > *:nth-child(3) { animation-delay: 0.12s; }
+    .slide.on .stagger > *:nth-child(4) { animation-delay: 0.16s; }
+    .slide.on .stagger > *:nth-child(5) { animation-delay: 0.20s; }
+    .slide.on .stagger > *:nth-child(6) { animation-delay: 0.24s; }
+    .slide.on .stagger > *:nth-child(7) { animation-delay: 0.28s; }
+    .slide.on .stagger > *:nth-child(8) { animation-delay: 0.32s; }
+    @media (prefers-reduced-motion: reduce) {
+      .slide.on, .slide.on .stagger > * { animation: none; }
+    }
+    .top {
+      display: flex;
+      align-items: baseline;
+      gap: 0.55rem;
+      min-height: 1.2rem;
+    }
+    .code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       color: var(--accent);
+      font-weight: 700;
+      font-size: 0.78rem;
       letter-spacing: 0.08em;
-      font-size: 0.8rem;
-      text-transform: uppercase;
-      font-weight: 600;
+    }
+    .eyebrow {
+      color: var(--muted);
+      font-size: 0.75rem;
+      letter-spacing: 0.04em;
     }
     h1 {
       margin: 0;
-      font-size: clamp(1.8rem, 4.2vw, 3rem);
-      line-height: 1.15;
+      font-size: clamp(1.55rem, 3.1vw, 2.35rem);
+      line-height: 1.12;
       font-weight: 700;
     }
     h2 {
       margin: 0;
-      font-size: clamp(1.35rem, 2.8vw, 2.1rem);
+      font-size: clamp(1.12rem, 2vw, 1.48rem);
       line-height: 1.25;
+      font-weight: 700;
     }
     .lead {
+      margin: 0;
       color: var(--muted);
-      font-size: clamp(1rem, 1.6vw, 1.2rem);
-      max-width: 48rem;
-      line-height: 1.55;
+      font-size: clamp(0.82rem, 1.15vw, 0.95rem);
+      line-height: 1.45;
+      max-width: 62rem;
     }
-    .hero {
-      margin-top: auto;
-      margin-bottom: auto;
+    .lead strong, .good { color: var(--accent); }
+    .bad { color: var(--warn); }
+    .fill { flex: 1; min-height: 0; }
+    .split {
+      flex: 1;
+      min-height: 0;
       display: grid;
-      gap: 1rem;
+      grid-template-columns: 1.05fr 0.95fr;
+      gap: 0.6rem;
     }
-    .pill-row { display: flex; flex-wrap: wrap; gap: 0.5rem; }
-    .pill {
+    .split.even { grid-template-columns: 1fr 1fr; }
+    .panel {
+      border: 1px solid var(--line);
+      background: rgba(20,28,39,0.82);
+      border-radius: 10px;
+      padding: 0.6rem 0.7rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.4rem;
+      min-height: 0;
+    }
+    .panel h3 {
+      margin: 0;
+      font-size: 0.92rem;
+      color: var(--accent);
+    }
+    .panel p, .panel li {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.8rem;
+      line-height: 1.4;
+    }
+    .kicker {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.68rem;
+      letter-spacing: 0.06em;
+      color: var(--blue);
+    }
+    .rail {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      display: flex;
+      flex-direction: column;
+      flex: 1;
+      min-height: 0;
+    }
+    .rail li {
+      flex: 1;
+      display: grid;
+      grid-template-columns: 5.2rem 1fr;
+      gap: 0.45rem;
+      align-items: center;
+      border-top: 1px solid var(--line);
+      padding: 0.28rem 0;
+      font-size: 0.8rem;
+    }
+    .rail li:first-child { border-top: 0; }
+    .rail b { color: var(--text); font-weight: 650; }
+    .rail span { color: var(--muted); }
+    .shot {
+      margin: 0;
+      min-height: 0;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      overflow: hidden;
+      background: #1a1510;
+    }
+    .shot img {
+      flex: 1;
+      min-height: 0;
+      width: 100%;
+      object-fit: contain;
+      display: block;
+    }
+    .shot figcaption {
+      margin: 0;
+      padding: 0.28rem 0.55rem;
+      font-size: 0.72rem;
+      color: var(--muted);
+      background: #141c27;
+      border-top: 1px solid var(--line);
+    }
+    .pills, .chips { display: flex; flex-wrap: wrap; gap: 0.32rem; }
+    .pill, .chip {
       border: 1px solid var(--line);
       background: rgba(255,255,255,0.03);
       border-radius: 999px;
-      padding: 0.35rem 0.8rem;
-      font-size: 0.85rem;
+      padding: 0.18rem 0.55rem;
+      font-size: 0.75rem;
       color: var(--muted);
     }
-    .pill strong { color: var(--text); font-weight: 600; }
-    .flow {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 0.4rem;
-      align-items: center;
+    .pill strong { color: var(--text); font-weight: 640; }
+    .chip {
+      border-radius: 6px;
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      font-size: clamp(0.75rem, 1.3vw, 0.95rem);
       color: var(--blue);
     }
-    .flow span {
-      border: 1px solid var(--line);
-      background: var(--panel);
-      padding: 0.35rem 0.55rem;
-      border-radius: 6px;
-    }
-    .flow i { color: var(--muted); font-style: normal; }
-    .img-wrap {
+    .cover-grid {
       flex: 1;
       min-height: 0;
-      border: 1px solid var(--line);
-      border-radius: 12px;
-      overflow: hidden;
-      background: #1a1510;
-      display: flex;
-      align-items: center;
-      justify-content: center;
+      display: grid;
+      grid-template-columns: 1.15fr 0.85fr;
+      gap: 0.6rem;
     }
-    .img-wrap img {
-      width: 100%;
-      height: 100%;
-      object-fit: contain;
-      display: block;
+    .motif {
+      display: grid;
+      grid-template-columns: 1fr auto 1fr;
+      gap: 0.45rem;
+      min-height: 0;
+    }
+    .motif-col {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: rgba(20,28,39,0.88);
+      padding: 0.55rem 0.65rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.35rem;
+      min-height: 0;
+    }
+    .motif-col ol {
+      margin: 0;
+      padding: 0;
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      flex: 1;
+      justify-content: space-between;
+      gap: 0.28rem;
+    }
+    .motif-col li {
+      font-size: 0.78rem;
+      color: var(--muted);
+      line-height: 1.35;
+      padding-left: 0.85rem;
+      position: relative;
+    }
+    .motif-col li::before {
+      content: "";
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      position: absolute;
+      left: 0;
+      top: 0.4rem;
+      background: var(--warn);
+    }
+    .motif-col.good li::before { background: var(--accent); }
+    .motif-col b { font-size: 0.84rem; }
+    .bridge {
+      writing-mode: vertical-rl;
+      align-self: center;
+      letter-spacing: 0.18em;
+      font-size: 0.72rem;
+      color: var(--warn);
+      border: 1px dashed var(--line);
+      border-radius: 999px;
+      padding: 0.55rem 0.28rem;
+    }
+    .outline {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.28rem 0.7rem;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+    .outline li {
+      display: grid;
+      grid-template-columns: 1.6rem 1fr;
+      gap: 0.35rem;
+      font-size: 0.78rem;
+      color: var(--muted);
+      align-items: baseline;
+    }
+    .outline em {
+      font-style: normal;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      color: var(--accent);
+      font-size: 0.72rem;
     }
     table {
       width: 100%;
       border-collapse: collapse;
-      font-size: clamp(0.78rem, 1.25vw, 0.95rem);
-      background: rgba(20,28,39,0.7);
+      font-size: 0.78rem;
+      background: rgba(20,28,39,0.78);
       border: 1px solid var(--line);
       border-radius: 10px;
       overflow: hidden;
     }
     th, td {
       border-bottom: 1px solid var(--line);
-      padding: 0.7rem 0.85rem;
+      padding: 0.38rem 0.55rem;
       text-align: left;
       vertical-align: top;
-      line-height: 1.4;
+      line-height: 1.35;
     }
     th {
       background: rgba(61,255,168,0.08);
       color: var(--accent);
-      font-weight: 600;
+      font-weight: 640;
     }
     tr:last-child td { border-bottom: 0; }
-    td:first-child { color: var(--muted); width: 22%; }
-    .grid2 {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 1rem;
+    td:first-child { color: var(--blue); width: 18%; white-space: nowrap; }
+    .rows {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 0.38rem;
+      flex: 0 0 auto;
+    }
+    .rows li {
+      display: flex;
+      flex-direction: column;
+      gap: 0.28rem;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(20,28,39,0.84);
+      padding: 0.5rem 0.65rem 0.45rem;
+      min-height: 0;
+    }
+    .row-top { display: flex; flex-direction: column; gap: 0.16rem; }
+    .row-top b { font-size: 0.88rem; }
+    .row-top span, .row-bot { font-size: 0.76rem; line-height: 1.4; }
+    .row-bot {
+      color: var(--text);
+      border-top: 1px solid var(--line);
+      padding-top: 0.32rem;
+    }
+    .note {
+      font-size: 0.72rem;
+      color: var(--muted);
+      border-top: 1px solid var(--line);
+      padding-top: 0.28rem;
+    }
+    .defs {
+      margin: 0;
+      display: flex;
+      flex-direction: column;
       flex: 1;
       min-height: 0;
     }
-    @media (max-width: 900px) {
-      .grid2 { grid-template-columns: 1fr; }
+    .defs div {
+      flex: 1;
+      display: grid;
+      grid-template-columns: 6.2rem 1fr;
+      gap: 0.4rem;
+      align-items: center;
+      border-top: 1px solid var(--line);
+      font-size: 0.78rem;
     }
-    .card {
-      border: 1px solid var(--line);
-      background: rgba(20,28,39,0.75);
-      border-radius: 12px;
-      padding: 1rem 1.1rem;
+    .defs div:first-child { border-top: 0; }
+    .defs dt { color: var(--blue); }
+    .defs dd { margin: 0; color: var(--muted); }
+    .steps {
+      margin: 0;
+      padding: 0;
+      list-style: none;
       display: flex;
       flex-direction: column;
+      flex: 1;
+      min-height: 0;
+    }
+    .steps li {
+      flex: 1;
+      display: grid;
+      grid-template-columns: 1.4rem 1fr;
+      gap: 0.4rem;
+      align-items: center;
+      border-top: 1px solid var(--line);
+      font-size: 0.8rem;
+      color: var(--muted);
+    }
+    .steps li:first-child { border-top: 0; }
+    .steps b { color: var(--accent); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .cmd {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.74rem;
+      line-height: 1.45;
+      color: var(--blue);
+      background: rgba(0,0,0,0.25);
+      border-radius: 8px;
+      padding: 0.4rem 0.5rem;
+    }
+    .quad {
+      flex: 1;
+      min-height: 0;
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
       gap: 0.45rem;
     }
-    .card h3 {
-      margin: 0;
-      font-size: 1.05rem;
-      color: var(--accent);
-    }
-    .card p, .card li {
-      margin: 0;
-      color: var(--muted);
-      line-height: 1.45;
-      font-size: 0.92rem;
-    }
-    .card ol, .card ul {
-      margin: 0;
-      padding-left: 1.1rem;
-    }
-    .footer-bar {
-      position: fixed;
-      left: 0; right: 0; bottom: 0;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 1rem;
-      padding: 0.65rem 1.2rem;
-      background: rgba(8,12,18,0.88);
-      border-top: 1px solid var(--line);
-      backdrop-filter: blur(8px);
-      font-size: 0.82rem;
-      color: var(--muted);
-      z-index: 10;
-    }
-    .nav button {
-      appearance: none;
+    .col {
       border: 1px solid var(--line);
-      background: var(--panel);
-      color: var(--text);
-      border-radius: 8px;
-      padding: 0.4rem 0.75rem;
-      cursor: pointer;
-      font: inherit;
+      background: rgba(20,28,39,0.86);
+      border-radius: 10px;
+      padding: 0.55rem 0.6rem 0.6rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.32rem;
+      min-height: 0;
     }
-    .nav button:hover { border-color: var(--accent); }
-    .progress {
-      height: 3px;
-      background: var(--line);
-      position: fixed;
-      top: 0; left: 0; right: 0;
-      z-index: 11;
-    }
-    .progress > i {
-      display: block;
-      height: 100%;
-      width: 0;
-      background: linear-gradient(90deg, var(--accent), var(--blue));
-    }
-    .big-quote {
-      font-size: clamp(1.15rem, 2.2vw, 1.6rem);
-      line-height: 1.45;
-      max-width: 40rem;
-      border-left: 3px solid var(--accent);
+    .col h3 { margin: 0; font-size: 0.9rem; }
+    .col p, .col li { margin: 0; color: var(--muted); font-size: 0.76rem; line-height: 1.38; }
+    .col ul {
+      margin: 0;
       padding-left: 1rem;
-      color: var(--text);
+      display: flex;
+      flex-direction: column;
+      justify-content: space-evenly;
+      gap: 0.28rem;
+      flex: 1;
+    }
+    .mini {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.32rem;
+      flex: 1;
+      align-content: stretch;
+    }
+    .mini div {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 0.4rem 0.45rem;
+      background: rgba(0,0,0,0.18);
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 0.12rem;
+    }
+    .mini b { font-size: 0.8rem; color: var(--text); }
+    .mini span { font-size: 0.72rem; color: var(--muted); }
+    .close-grid {
+      flex: 1;
+      min-height: 0;
+      display: grid;
+      grid-template-columns: 1.2fr 0.8fr;
+      gap: 0.6rem;
+    }
+    .quote {
+      margin: 0;
+      font-size: clamp(1rem, 1.7vw, 1.25rem);
+      line-height: 1.4;
+      border-left: 3px solid var(--accent);
+      padding-left: 0.7rem;
     }
     code {
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -224,6 +461,57 @@
       font-size: 0.92em;
     }
     a { color: var(--accent); }
+    .progress {
+      height: 2px;
+      background: rgba(42,56,72,0.9);
+      position: fixed;
+      top: 0; left: 0; right: 0;
+      z-index: 20;
+    }
+    .progress > i {
+      display: block;
+      height: 100%;
+      width: 0;
+      background: linear-gradient(90deg, var(--accent), var(--blue));
+    }
+    .footer-bar {
+      position: fixed;
+      left: 0; right: 0; bottom: 0;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.8rem;
+      padding: 0.32rem 0.85rem;
+      background: rgba(8,12,18,0.9);
+      border-top: 1px solid var(--line);
+      font-size: 0.74rem;
+      color: var(--muted);
+      z-index: 20;
+    }
+    .mute {
+      appearance: none;
+      border: 1px solid var(--line);
+      background: transparent;
+      color: var(--muted);
+      border-radius: 999px;
+      padding: 0.12rem 0.55rem;
+      font: inherit;
+      font-size: 0.72rem;
+      cursor: pointer;
+    }
+    .mute[aria-pressed="true"] {
+      color: var(--bg);
+      background: var(--accent);
+      border-color: var(--accent);
+    }
+    .mute:hover { border-color: var(--accent); }
+    @media (max-width: 980px) {
+      .cover-grid, .split, .split.even, .close-grid, .quad, .motif { grid-template-columns: 1fr; }
+      .bridge { writing-mode: horizontal-tb; letter-spacing: 0.08em; justify-self: center; }
+      .deck { overflow: auto; }
+      .slide.on { height: auto; min-height: 100%; }
+      .shot { min-height: 180px; }
+    }
   </style>
 </head>
 <body>
@@ -231,288 +519,461 @@
   <div class="deck" id="deck">
 
     <section class="slide on" data-title="封面">
-      <div class="hero">
-        <div class="eyebrow">MatrixNEXT 2026 · 创意赛道 · 流程自动驾驶</div>
-        <h1>Sortie Deck</h1>
-        <p class="lead">面向中大型产研团队的 AI 原生办公迭代控制面。可确认航线、产物契约与人在环，把传话成本换成可审计的出击。</p>
-        <div class="pill-row">
-          <span class="pill"><strong>队伍</strong> SortieDeck</span>
-          <span class="pill"><strong>开源</strong> Apache-2.0</span>
-          <span class="pill"><strong>编排</strong> LangGraph</span>
-          <span class="pill"><strong>仓库</strong> lpliu-art/sortie-deck-todos</span>
+      <div class="top">
+        <span class="code">00</span>
+        <span class="eyebrow">MatrixNEXT 2026 · 创意赛道 · 流程自动驾驶</span>
+      </div>
+      <h1>Sortie Deck</h1>
+      <p class="lead">团队已经有 AI，协作总线仍是 <strong class="bad">IM 传话筒</strong>。Sortie Deck 把办公迭代收成控制面：可确认航线、产物契约、人在环、共享上下文。</p>
+      <div class="cover-grid">
+        <div class="motif stagger">
+          <div class="motif-col">
+            <b class="bad">传话筒现状</b>
+            <ol>
+              <li>产品打开自己的 AI，写出需求</li>
+              <li>澄清会纪要再经 IM 转发</li>
+              <li>研发、测试各自粘贴进自己的 AI</li>
+              <li>截图当契约，群里 @ 当门禁</li>
+            </ol>
+          </div>
+          <div class="bridge">真相被拆碎</div>
+          <div class="motif-col good">
+            <b class="good">控制面接管</b>
+            <ol>
+              <li>同一份 Brief</li>
+              <li>规划官提案，真人确认后出击</li>
+              <li>角色 Agent 写命名产物</li>
+              <li>HITL 可暂停、可恢复、可回放</li>
+            </ol>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="kicker">本场结构</div>
+          <ol class="outline stagger">
+            <li><em>01</em>传话筒：真相碎、航线隐、门禁盲</li>
+            <li><em>02</em>控制面四件套</li>
+            <li><em>03</em>改造前后对照</li>
+            <li><em>04</em>中大型产研的定性价值</li>
+            <li><em>05</em>上下文平权与结构化协作</li>
+            <li><em>06</em>机制：为什么不是聊天框</li>
+            <li><em>07</em>栈与一条可演示出击</li>
+            <li><em>08</em>人守住出击权</li>
+          </ol>
+          <div class="pills">
+            <span class="pill"><strong>队伍</strong> SortieDeck</span>
+            <span class="pill"><strong>许可</strong> Apache-2.0</span>
+            <span class="pill"><strong>编排</strong> LangGraph</span>
+            <span class="pill"><strong>仓库</strong> lpliu-art/sortie-deck-todos</span>
+          </div>
         </div>
       </div>
     </section>
 
     <section class="slide" data-title="问题">
-      <div class="eyebrow">01 · 问题</div>
-      <h2>我们已经有 AI，为什么协作还是乱的？</h2>
-      <p class="lead">中大型产研已经人手一个 AI，总线仍是人和 IM：各自开窗口、粘贴接力、截图当契约。接力越长，迭代越慢，决策越难回放。</p>
-      <div class="flow">
-        <span>产品</span><i>→</i><span>AI</span><i>→</i><span>需求文档</span><i>→</i>
-        <span>澄清会议</span><i>→</i><span>IM 传话</span><i>→</i>
-        <span>开发/测试各自的 AI</span><i>→</i><span>提测？</span>
+      <div class="top">
+        <span class="code">01</span>
+        <span class="eyebrow">问题 · 核心矛盾</span>
       </div>
-      <div class="img-wrap">
-        <img src="../../assets/sortie-before-relay-handdrawn.jpg" alt="改造前：传话筒式 AI 协作" />
+      <h2>已经有 AI，总线仍是传话筒</h2>
+      <p class="lead">缺的不是又一个聊天窗口。缺的是一条大家共同遵守的出击：<span class="bad">真相碎在粘贴里，航线停在口头，门禁停在群 @。</span></p>
+      <div class="split">
+        <div class="panel">
+          <div class="kicker">一条典型接力</div>
+          <ol class="rail stagger">
+            <li><b>产品</b><span>自己的 AI 写出需求文档</span></li>
+            <li><b>澄清会</b><span>纪要经 IM 再转发一遍</span></li>
+            <li><b>研发 / 测试</b><span>把同一份需求丢进各自的 AI</span></li>
+            <li><b>提测</b><span>继续传话；截图当契约</span></li>
+          </ol>
+          <div class="pills">
+            <span class="pill"><strong>真相</strong> 多份粘贴</span>
+            <span class="pill"><strong>航线</strong> 看不见</span>
+            <span class="pill"><strong>门禁</strong> 审不了</span>
+          </div>
+        </div>
+        <figure class="shot">
+          <img src="../../assets/sortie-before-relay-handdrawn.jpg" alt="改造前：传话筒式 AI 协作" />
+          <figcaption>改造前 · 人在 IM 里当传话筒</figcaption>
+        </figure>
       </div>
     </section>
 
     <section class="slide" data-title="方案">
-      <div class="eyebrow">02 · 方案</div>
-      <h2>把「聊天接力」换成控制面</h2>
-      <p class="lead">
-        Sortie Deck 不是又一个聊天框。按任务集结角色 Agent，用 LangGraph 编排出击航线，
-        关键门禁保留人在环，阶段之间用产物契约传递结果。
-      </p>
-      <div class="flow">
-        <span>Brief</span><i>→</i><span>航线规划官</span><i>→</i><span>真人确认</span><i>→</i>
-        <span>角色 Agent</span><i>→</i><span>HITL</span><i>→</i><span>提测 / 交付</span>
+      <div class="top">
+        <span class="code">02</span>
+        <span class="eyebrow">方案 · 控制面</span>
       </div>
-      <div class="img-wrap">
-        <img src="../../assets/sortie-after-control-plane-handdrawn.jpg" alt="改造后：Sortie Deck 控制面" />
+      <h2>用控制面换掉聊天接力</h2>
+      <p class="lead">Sortie Deck 按任务集结角色 Agent，用 LangGraph 编排出击。四件套一起上，传话筒才退场。</p>
+      <div class="split">
+        <figure class="shot">
+          <img src="../../assets/sortie-after-control-plane-handdrawn.jpg" alt="改造后：Sortie Deck 控制面" />
+          <figcaption>改造后 · Brief → 确认航线 → 契约 → HITL</figcaption>
+        </figure>
+        <div class="panel">
+          <div class="kicker">控制面四件套</div>
+          <div class="mini stagger">
+            <div><b>可确认航线</b><span>规划官提案，真人确认或手改后才编译图、才出击。</span></div>
+            <div><b>产物契约</b><span>阶段写命名文件。下游读文件，不读某个人的聊天记录。</span></div>
+            <div><b>HITL 门禁</b><span><code>interrupt()</code> 暂停。放行、打回、改写、停止、重路由可回放。</span></div>
+            <div><b>共享上下文</b><span>同一 Brief、同一航线、同一组产物与决策，角色之间拉平。</span></div>
+          </div>
+          <div class="chips">
+            <span class="chip">Brief</span>
+            <span class="chip">规划官</span>
+            <span class="chip">真人确认</span>
+            <span class="chip">角色 Agent</span>
+            <span class="chip">HITL</span>
+            <span class="chip">提测 / 交付</span>
+          </div>
+        </div>
       </div>
     </section>
 
     <section class="slide" data-title="对照">
-      <div class="eyebrow">03 · 改造前后</div>
-      <h2>一表看清差异</h2>
-      <table>
-        <thead>
-          <tr><th>维度</th><th>改造前</th><th>改造后 · Sortie Deck</th></tr>
-        </thead>
-        <tbody>
-          <tr>
-            <td>总线</td>
-            <td>IM 当总线、人当传话筒</td>
-            <td>小队频道可见协作；IM 不再当真相源</td>
-          </tr>
-          <tr>
-            <td>AI 用法</td>
-            <td>每人各开 AI、粘贴接力</td>
-            <td>任务级角色 Agent + 可插拔执行器</td>
-          </tr>
-          <tr>
-            <td>契约</td>
-            <td>截图 / 聊天当契约</td>
-            <td>命名产物文件，下游读文件</td>
-          </tr>
-          <tr>
-            <td>航线</td>
-            <td>口头约定</td>
-            <td>Brief → 规划官提案 → <strong>真人确认</strong> 后出击</td>
-          </tr>
-          <tr>
-            <td>门禁</td>
-            <td>群里 @ 一下</td>
-            <td><code>LangGraph interrupt()</code> HITL（可恢复、可审计）</td>
-          </tr>
-          <tr>
-            <td>上下文</td>
-            <td>粘贴锁在个人聊天里</td>
-            <td>全员同一 Brief、航线、产物与 HITL</td>
-          </tr>
-        </tbody>
-      </table>
+      <div class="top">
+        <span class="code">03</span>
+        <span class="eyebrow">对照 · 传话筒 vs 控制面</span>
+      </div>
+      <h2>六处差异，都回到同一件事</h2>
+      <p class="lead">IM 可以通知。真相留在航线、命名产物和 HITL 上。</p>
+      <div class="split even fill">
+        <div class="panel">
+          <div class="kicker">传话筒的三笔账</div>
+          <ol class="rail stagger">
+            <li><b>真相碎了</b><span>需求、纪要、截图各有一份，对不上版本。</span></li>
+            <li><b>航线是口头的</b><span>谁先做、哪里并行、何时提测，群里现说。</span></li>
+            <li><b>门禁审不了</b><span>放行停在一句 @，事后无法回放。</span></li>
+          </ol>
+          <p class="note">中大型产研的成本就在这三笔：接力变长，迭代变慢，合规对不上记录。</p>
+        </div>
+        <table>
+          <thead>
+            <tr><th>维度</th><th>传话筒</th><th>Sortie Deck</th></tr>
+          </thead>
+          <tbody class="stagger">
+            <tr><td>总线</td><td>IM 当总线，人当传话筒</td><td>小队频道可见协作</td></tr>
+            <tr><td>AI</td><td>每人各开窗口、粘贴接力</td><td>任务级角色 Agent + 可插拔执行器</td></tr>
+            <tr><td>契约</td><td>截图 / 聊天</td><td>命名产物，下游读文件</td></tr>
+            <tr><td>航线</td><td>口头约定</td><td>提案后<strong>真人确认</strong>才出击</td></tr>
+            <tr><td>门禁</td><td>群里 @ 一下</td><td><code>interrupt()</code> HITL，可恢复可审计</td></tr>
+            <tr><td>上下文</td><td>锁在个人聊天里</td><td>全员同一 Brief、航线、产物与 HITL</td></tr>
+          </tbody>
+        </table>
+      </div>
     </section>
 
     <section class="slide" data-title="商业价值">
-      <div class="eyebrow">04 · 商业价值</div>
-      <h2>少接力、快闭环、可审计、数据自持</h2>
-      <p class="lead">面向中大型产品与工程团队的定性结果，不是客户案例，也不是实测数字。</p>
-      <div class="grid2">
-        <div class="card">
-          <h3>降低接力成本</h3>
-          <p>产品、工程、测试、发布沿同一条出击交接，不再把需求誊进各自的聊天窗口。</p>
-        </div>
-        <div class="card">
-          <h3>加快迭代闭环</h3>
-          <p>航线确认后按阶段推进。并行波次对齐命名产物，不再干等群里对齐口径。</p>
-        </div>
-        <div class="card">
-          <h3>合规可回放</h3>
-          <p>谁确认了航线、哪一关放行或打回、产物写在哪条路径，都留在控制面上。</p>
-        </div>
-        <div class="card">
-          <h3>开源，可本地部署</h3>
-          <p>Apache-2.0。控制面、产物与知识可留在自有环境，出击上下文由团队自己掌管。</p>
+      <div class="top">
+        <span class="code">04</span>
+        <span class="eyebrow">商业价值 · 定性，非客户实测</span>
+      </div>
+      <h2>少传话，才有迭代控制权</h2>
+      <p class="lead">面向中大型产品与工程团队。下面是设计对应的定性结果，未引用客户，未给出实测数字。</p>
+      <ul class="rows stagger">
+        <li>
+          <div class="row-top">
+            <b>01 · 少接力</b>
+            <span class="bad">传话筒把同一份需求誊进产品、工程、测试、发布四个窗口。</span>
+          </div>
+          <div class="row-bot">控制面沿一条出击交接：四个角色读同一份 Brief 和命名产物。</div>
+        </li>
+        <li>
+          <div class="row-top">
+            <b>02 · 快闭环</b>
+            <span class="bad">并行波次停在群里等口径，迭代被 IM 排队。</span>
+          </div>
+          <div class="row-bot">航线确认后按阶段推进，波次对齐的是文件，不是下一条消息。</div>
+        </li>
+        <li>
+          <div class="row-top">
+            <b>03 · 可回放</b>
+            <span class="bad">谁确认了航线、谁放行了门禁，散落在聊天记录里。</span>
+          </div>
+          <div class="row-bot">确认、HITL 动作和产物路径留在控制面上，合规可以回放。</div>
+        </li>
+        <li>
+          <div class="row-top">
+            <b>04 · 数据自持</b>
+            <span class="bad">出击上下文若只活在外部聊天产品里，团队并不真正拥有它。</span>
+          </div>
+          <div class="row-bot">Apache-2.0，可本地部署。知识与产物留在自有环境。</div>
+        </li>
+      </ul>
+      <div class="panel fill">
+        <div class="kicker">四笔账都对着传话筒</div>
+        <div class="mini stagger">
+          <div><b>真相</b><span>不再拆成四份粘贴。Brief 与命名产物是这一次出击的版本。</span></div>
+          <div><b>航线</b><span>确认之后才跑。并行波次对齐文件，不等下一条群消息。</span></div>
+          <div><b>门禁</b><span>HITL 留在控制面上，合规回放的是动作，不是聊天摘录。</span></div>
+          <div><b>数据</b><span>开源、可本地部署。知识、记忆和产物留在自有环境。</span></div>
         </div>
       </div>
     </section>
 
-    <section class="slide" data-title="上下文平权">
-      <div class="eyebrow">05 · 上下文平权</div>
-      <h2>出击上的每个角色，读同一份真相</h2>
-      <p class="lead">产品、工程、测试、发布共享同一份 Brief、已确认航线、命名产物和 HITL 决策。没有只活在某一次私人对话里的特权粘贴。</p>
-      <div class="pill-row">
-        <span class="pill"><strong>产品</strong> 同一 Brief</span>
-        <span class="pill"><strong>工程</strong> 同一航线</span>
-        <span class="pill"><strong>测试</strong> 同一产物</span>
-        <span class="pill"><strong>发布</strong> 同一 HITL</span>
+    <section class="slide" data-title="平权与协作">
+      <div class="top">
+        <span class="code">05</span>
+        <span class="eyebrow">上下文平权 · 沟通协作</span>
       </div>
-      <div class="grid2">
-        <div class="card">
-          <h3>角色之间拉平</h3>
-          <p>下游读命名文件。上下文属于这次出击，不属于最后粘贴的那个人。</p>
+      <h2>同一份真相，协作发生在明处</h2>
+      <p class="lead">传话筒制造特权粘贴：最后粘贴的人掌握上下文。控制面把出击上下文拉平，再把讨论和审批分开。</p>
+      <div class="split even fill">
+        <div class="panel">
+          <div class="kicker">上下文平权</div>
+          <div class="mini stagger">
+            <div><b>产品 · Brief</b><span>任务说明只有一份，不靠转发。</span></div>
+            <div><b>工程 · 航线</b><span>确认后的阶段与并行，全员可见。</span></div>
+            <div><b>测试 · 产物</b><span>读命名文件，不对着截图猜版本。</span></div>
+            <div><b>发布 · HITL</b><span>放行与打回在同一条可恢复轨迹上。</span></div>
+          </div>
+          <p>知识与记忆按工作区、任务、角色作用域注入执行中的 Agent。带阶段标签的记忆只到达对应阶段，并行分支不会串味。</p>
         </div>
-        <div class="card">
-          <h3>知识与记忆按作用域到达</h3>
-          <p>工作区、任务、角色作用域把该知道的上下文注入执行中的 Agent。阶段标签挡住并行分支串味，避免结论只留在某一个聊天记录里。</p>
-        </div>
-      </div>
-    </section>
-
-    <section class="slide" data-title="沟通协作">
-      <div class="eyebrow">06 · 沟通协作</div>
-      <h2>频道看得见，门禁说了算</h2>
-      <p class="lead">小队频道是可见协作层。真相在航线、产物和 HITL。点名与斜杠命令是结构化操作，群里随手 @ 不再充当审批。</p>
-      <div class="flow">
-        <span>@product</span><i>·</i><span>@eng</span><i>·</i><span>@qa</span><i>·</i><span>@deploy</span>
-        <i>→</i>
-        <span>/confirm</span><i>·</i><span>/start</span><i>·</i><span>/approve</span><i>·</i><span>/rewrite</span><i>·</i><span>/stop</span>
-      </div>
-      <div class="grid2">
-        <div class="card">
-          <h3>协作发生在明处</h3>
-          <p>讨论、阶段消息和决策留在任务频道里，全员可见。IM 可以做通知，不能当真相源。</p>
-        </div>
-        <div class="card">
-          <h3>HITL 是一等门禁</h3>
-          <p><code>interrupt()</code> 暂停图。放行、打回、改写、停止、重路由回到同一条可恢复轨迹，并可以审计。</p>
+        <div class="panel">
+          <div class="kicker">结构化协作</div>
+          <p>小队频道让讨论、阶段消息和决策全员可见。它是协作层，真相仍在航线和产物上。</p>
+          <div class="chips">
+            <span class="chip">@product</span>
+            <span class="chip">@eng</span>
+            <span class="chip">@qa</span>
+            <span class="chip">@deploy</span>
+          </div>
+          <div class="chips">
+            <span class="chip">/confirm</span>
+            <span class="chip">/start</span>
+            <span class="chip">/approve</span>
+            <span class="chip">/reject</span>
+            <span class="chip">/rewrite</span>
+            <span class="chip">/stop</span>
+          </div>
+          <p>HITL 是一等门禁：<code>interrupt()</code> 暂停图。放行、打回、改写、停止、重路由都写回控制面。IM 只承担通知。</p>
         </div>
       </div>
     </section>
 
-    <section class="slide" data-title="创新点">
-      <div class="eyebrow">07 · 创新点</div>
-      <h2>为什么不是「又一个 Agent 聊天」</h2>
-      <div class="grid2">
-        <div class="card">
-          <h3>控制面一等公民</h3>
-          <p>任务、航线、HITL、产物都是一等对象，而不是埋在对话历史里。</p>
-        </div>
-        <div class="card">
-          <h3>可确认航线</h3>
-          <p>规划官提案节点（含并行）；真人确认/手改后才编译图出击。</p>
-        </div>
-        <div class="card">
-          <h3>契约化产物</h3>
-          <p>阶段写命名文件；下游读文件。并行路径作用域，避免互相覆盖。</p>
-        </div>
-        <div class="card">
-          <h3>图语义 HITL</h3>
-          <p><code>interrupt()</code> 暂停；放行 / 打回 / 改写 / 停止 / 重路由。</p>
-        </div>
+    <section class="slide" data-title="机制">
+      <div class="top">
+        <span class="code">06</span>
+        <span class="eyebrow">机制 · 拆掉传话筒的四个抓手</span>
       </div>
-    </section>
-
-    <section class="slide" data-title="技术栈">
-      <div class="eyebrow">08 · 技术栈</div>
-      <h2>可运行、可插拔、可本地部署</h2>
-      <div class="grid2">
-        <div class="card">
-          <h3>控制面</h3>
+      <h2>对象在控制面上，不在对话历史里</h2>
+      <div class="quad stagger fill">
+        <article class="col">
+          <div class="kicker">01</div>
+          <h3>任务是一等公民</h3>
           <ul>
-            <li>Python 3.12 · FastAPI · Pydantic v2</li>
-            <li>LangGraph + checkpointer</li>
-            <li>SSE 实时事件 · JSON/SQLite</li>
+            <li>出击、阶段、HITL、产物都是对象</li>
+            <li>Agent 是执行单元，不是唯一界面</li>
+            <li>状态可停、可恢复，不靠翻聊天记录</li>
           </ul>
-        </div>
-        <div class="card">
-          <h3>执行与工作台</h3>
+        </article>
+        <article class="col">
+          <div class="kicker">02</div>
+          <h3>先确认，再编译</h3>
           <ul>
-            <li>执行器：mock / Claude Code / Cursor CLI</li>
-            <li>React 19 · TypeScript · Vite</li>
-            <li>Tools · MCP · Skills 领域目录</li>
+            <li>规划官按 Brief 提案，含并行</li>
+            <li>真人确认或手改后才编译 LangGraph</li>
+            <li>未确认不能出击</li>
           </ul>
-        </div>
+        </article>
+        <article class="col">
+          <div class="kicker">03</div>
+          <h3>契约，不是粘贴</h3>
+          <ul>
+            <li>阶段输出命名文件</li>
+            <li>下游只读文件</li>
+            <li>并行路径作用域，避免互相覆盖</li>
+          </ul>
+        </article>
+        <article class="col">
+          <div class="kicker">04</div>
+          <h3>门禁是图语义</h3>
+          <ul>
+            <li><code>interrupt()</code> 暂停</li>
+            <li>放行 / 打回 / 改写 / 停止 / 重路由</li>
+            <li>权限阻断也可转成待人工处理</li>
+          </ul>
+        </article>
       </div>
-      <p class="lead" style="margin-top:0.5rem">
-        源码：<a href="https://github.com/lpliu-art/sortie-deck-todos/tree/dev" target="_blank" rel="noopener">github.com/lpliu-art/sortie-deck-todos</a>
-        · 完整说明：<a href="./matrixnext-2026.md">matrixnext-2026.md</a>
-      </p>
     </section>
 
-    <section class="slide" data-title="演示">
-      <div class="eyebrow">09 · 演示路径</div>
-      <h2>一条完整出击（可剪成 ≤3 分钟视频）</h2>
-      <div class="grid2">
-        <div class="card">
-          <h3>剧本</h3>
-          <ol>
-            <li>登录工作台，填写任务 Brief</li>
-            <li>查看航线规划官提案并确认</li>
-            <li>出击，观察轨道与并行阶段</li>
-            <li>命中 HITL：放行 / 改写</li>
-            <li>打开阶段产物：读文件不读聊天</li>
+    <section class="slide" data-title="落地">
+      <div class="top">
+        <span class="code">07</span>
+        <span class="eyebrow">落地 · 可运行、可本地部署</span>
+      </div>
+      <h2>一条出击，剪得进三分钟</h2>
+      <div class="split even fill">
+        <div class="panel">
+          <div class="kicker">栈</div>
+          <dl class="defs">
+            <div><dt>控制面</dt><dd>Python 3.12 · FastAPI · Pydantic v2 · SSE</dd></div>
+            <div><dt>编排</dt><dd>LangGraph · interrupt / Command · checkpointer</dd></div>
+            <div><dt>存储</dt><dd>JSON / SQLite · 产物本地或 S3</dd></div>
+            <div><dt>执行器</dt><dd>mock · Claude Code · Cursor CLI · deploy_shell</dd></div>
+            <div><dt>工作台</dt><dd>React 19 · TypeScript · Vite</dd></div>
+            <div><dt>编制</dt><dd>Tools · MCP · Skills · 多作用域记忆</dd></div>
+          </dl>
+          <p>源码 <a href="https://github.com/lpliu-art/sortie-deck-todos/tree/dev" target="_blank" rel="noopener">github.com/lpliu-art/sortie-deck-todos</a> · 说明 <a href="./matrixnext-2026.md">matrixnext-2026.md</a></p>
+        </div>
+        <div class="panel">
+          <div class="kicker">演示剧本</div>
+          <ol class="steps stagger">
+            <li><b>1</b>登录工作台，填写任务 Brief</li>
+            <li><b>2</b>看航线规划官提案并确认</li>
+            <li><b>3</b>出击，看轨道与并行阶段</li>
+            <li><b>4</b>命中 HITL：放行或改写</li>
+            <li><b>5</b>打开阶段产物：读文件，不读聊天</li>
+          </ol>
+          <div class="cmd">pip install -e ".[dev]"<br>sortie api &nbsp;→ :8787<br>npm run dev &nbsp;（apps/web）→ :5173<br>admin / admin123<br>sortie smoke</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="slide" data-title="收束">
+      <div class="top">
+        <span class="code">08</span>
+        <span class="eyebrow">MatrixNEXT 2026 · SortieDeck</span>
+      </div>
+      <h1>让 Agent 接手流程，<br>让人守住出击权。</h1>
+      <div class="close-grid">
+        <div class="panel">
+          <p class="quote">同一份 Brief，同一条已确认航线，每一次放行都留在控制面上。</p>
+          <p class="lead">传话筒退场之后，办公迭代仍由人拍板：确认航线、守住门禁、掌握自己的数据。</p>
+          <div class="pills">
+            <span class="pill">创意赛道 · 流程自动驾驶</span>
+            <span class="pill">Apache-2.0</span>
+            <span class="pill">LangGraph</span>
+            <span class="pill">谢谢</span>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="kicker">记住这四句</div>
+          <ol class="rail">
+            <li><b>问题</b><span>有 AI，仍在 IM 里传话</span></li>
+            <li><b>航线</b><span>确认之后才出击</span></li>
+            <li><b>契约</b><span>下游读文件</span></li>
+            <li><b>门禁</b><span>HITL 可回放</span></li>
           </ol>
         </div>
-        <div class="card">
-          <h3>本地启动</h3>
-          <p><code>pip install -e ".[dev]"</code></p>
-          <p><code>sortie api</code> → :8787</p>
-          <p><code>npm run dev</code>（apps/web）→ :5173</p>
-          <p>账号 <code>admin</code> / <code>admin123</code></p>
-          <p>冒烟：<code>sortie smoke</code></p>
-        </div>
-      </div>
-    </section>
-
-    <section class="slide" data-title="结尾">
-      <div class="hero">
-        <div class="eyebrow">MatrixNEXT 2026</div>
-        <h1>让 Agent 接手流程，<br />让人守住出击权。</h1>
-        <p class="big-quote">同一份 Brief，同一条航线，每一次放行都留在控制面上。</p>
-        <p class="lead">Sortie Deck —— 少接力、上下文平权、协作可审计。办公迭代的控制面，而不是又一个聊天框。</p>
-        <div class="pill-row">
-          <span class="pill">创意赛道 · 流程自动驾驶</span>
-          <span class="pill">SortieDeck</span>
-          <span class="pill">谢谢</span>
-        </div>
       </div>
     </section>
   </div>
 
-  <div class="footer-bar">
-    <span id="label">1 / 11 · 封面</span>
-    <div class="nav">
-      <button type="button" id="prev">← 上一页</button>
-      <button type="button" id="next">下一页 →</button>
-    </div>
-    <span>← → 或空格翻页 · F 全屏</span>
-  </div>
+  <footer class="footer-bar">
+    <span id="label">1 / 9 · 封面</span>
+    <span>← → · 空格翻页 · F 全屏</span>
+    <button type="button" id="mute" class="mute" aria-pressed="false" aria-label="翻页音效，当前关闭">音效关</button>
+  </footer>
 
   <script>
     const slides = [...document.querySelectorAll(".slide")];
     const bar = document.getElementById("bar");
     const label = document.getElementById("label");
+    const muteBtn = document.getElementById("mute");
+    const SOUND_KEY = "sortie-deck-slide-sound";
     let i = 0;
+    let booted = false;
+    let muted = localStorage.getItem(SOUND_KEY) !== "on";
+    let audioCtx = null;
+    let noise = null;
 
-    function show(n) {
-      i = Math.max(0, Math.min(slides.length - 1, n));
-      slides.forEach((s, idx) => s.classList.toggle("on", idx === i));
-      bar.style.width = ((i + 1) / slides.length * 100) + "%";
-      const title = slides[i].dataset.title || "";
-      label.textContent = (i + 1) + " / " + slides.length + " · " + title;
-      history.replaceState(null, "", "#" + (i + 1));
+    function paintMute() {
+      muteBtn.setAttribute("aria-pressed", muted ? "false" : "true");
+      muteBtn.setAttribute("aria-label", muted ? "翻页音效，当前关闭" : "翻页音效，当前开启");
+      muteBtn.textContent = muted ? "音效关" : "音效开";
     }
 
-    document.getElementById("prev").onclick = () => show(i - 1);
-    document.getElementById("next").onclick = () => show(i + 1);
+    async function ensureCtx() {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return null;
+      if (!audioCtx) audioCtx = new AC();
+      if (audioCtx.state === "suspended") await audioCtx.resume();
+      if (!noise) {
+        const len = Math.floor(audioCtx.sampleRate * 0.2);
+        noise = audioCtx.createBuffer(1, len, audioCtx.sampleRate);
+        const data = noise.getChannelData(0);
+        for (let n = 0; n < len; n++) data[n] = (Math.random() * 2 - 1) * (1 - n / len);
+      }
+      return audioCtx;
+    }
+
+    async function blip(dir) {
+      if (muted) return;
+      const ctx = await ensureCtx();
+      if (!ctx) return;
+      const t = ctx.currentTime;
+      const src = ctx.createBufferSource();
+      src.buffer = noise;
+      const bp = ctx.createBiquadFilter();
+      bp.type = "bandpass";
+      bp.Q.value = 0.65;
+      bp.frequency.setValueAtTime(dir > 0 ? 420 : 880, t);
+      bp.frequency.exponentialRampToValueAtTime(dir > 0 ? 1400 : 260, t + 0.12);
+      const ng = ctx.createGain();
+      ng.gain.setValueAtTime(0.0001, t);
+      ng.gain.exponentialRampToValueAtTime(0.03, t + 0.015);
+      ng.gain.exponentialRampToValueAtTime(0.0001, t + 0.14);
+      src.connect(bp); bp.connect(ng); ng.connect(ctx.destination);
+      src.start(t); src.stop(t + 0.16);
+
+      const osc = ctx.createOscillator();
+      const og = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.setValueAtTime(dir > 0 ? 620 : 360, t);
+      osc.frequency.exponentialRampToValueAtTime(dir > 0 ? 240 : 180, t + 0.1);
+      og.gain.setValueAtTime(0.0001, t);
+      og.gain.exponentialRampToValueAtTime(0.02, t + 0.012);
+      og.gain.exponentialRampToValueAtTime(0.0001, t + 0.11);
+      osc.connect(og); og.connect(ctx.destination);
+      osc.start(t); osc.stop(t + 0.12);
+    }
+
+    function show(n, dir) {
+      const next = Math.max(0, Math.min(slides.length - 1, n));
+      if (booted && next === i) return;
+      const direction = dir ?? (next >= i ? 1 : -1);
+      const changed = booted;
+      slides.forEach((s) => s.classList.remove("on", "from-left"));
+      i = next;
+      const el = slides[i];
+      if (direction < 0) el.classList.add("from-left");
+      void el.offsetWidth;
+      el.classList.add("on");
+      bar.style.width = ((i + 1) / slides.length * 100) + "%";
+      label.textContent = (i + 1) + " / " + slides.length + " · " + (el.dataset.title || "");
+      history.replaceState(null, "", "#" + (i + 1));
+      if (changed) blip(direction);
+      booted = true;
+    }
+
+    muteBtn.addEventListener("click", () => {
+      muted = !muted;
+      localStorage.setItem(SOUND_KEY, muted ? "off" : "on");
+      paintMute();
+      if (!muted) blip(1);
+    });
 
     window.addEventListener("keydown", (e) => {
+      if (e.repeat) return;
+      if (e.target === muteBtn && (e.key === " " || e.key === "Enter")) return;
       if (["ArrowRight", "PageDown", " ", "Enter"].includes(e.key)) {
-        e.preventDefault(); show(i + 1);
+        e.preventDefault();
+        show(i + 1, 1);
       } else if (["ArrowLeft", "PageUp", "Backspace"].includes(e.key)) {
-        e.preventDefault(); show(i - 1);
-      } else if (e.key === "Home") show(0);
-      else if (e.key === "End") show(slides.length - 1);
+        e.preventDefault();
+        show(i - 1, -1);
+      } else if (e.key === "Home") show(0, -1);
+      else if (e.key === "End") show(slides.length - 1, 1);
       else if (e.key === "f" || e.key === "F") {
         if (!document.fullscreenElement) document.documentElement.requestFullscreen?.();
         else document.exitFullscreen?.();
+      } else if (e.key === "m" || e.key === "M") {
+        muteBtn.click();
       }
     });
 
+    paintMute();
     const hash = parseInt(location.hash.slice(1), 10);
     show(Number.isFinite(hash) && hash > 0 ? hash - 1 : 0);
   </script>
