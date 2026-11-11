@@ -131,10 +131,10 @@ sortie smoke
 
 | 项 | 内容 |
 |----|------|
-| 可运行智能体 / 工作台链接 | _待部署后填写，例如 `https://…`_ |
-| 演示账号 | _待填写（建议只读或演示专用账号）_ |
-| 访问密码（如有） | _无则写「无」；有则在此注明_ |
-| 演示视频链接 | _待上传后填写（≤3 分钟）_ |
+| 可运行智能体 / 工作台链接 | http://47.238.69.212:8080 （Sortie Deck 0.5.0，已核验可达） |
+| 演示账号 | _待填写（建议只读或演示专用账号；勿直接写生产 admin）_ |
+| 访问密码（如有） | 无（登录口令见演示账号） |
+| 演示视频链接 | https://github.com/lpliu-art/sortie-deck-todos/releases/download/matrixnext-2026-demo/sortie-deck-matrixnext-demo-vo-3min-ali.mp4 （对应草稿 Release `matrixnext-2026-demo`，**发布该 Release 后**链接才可下载；约 2:48 ≤3 分钟） |
 | 源码仓库 | https://github.com/lpliu-art/sortie-deck-todos/tree/dev |
 
 > 报名与作品提交是两个环节：完成本文档后，请在活动页「作品提交」入口用同一 MOI 账号提交三项链接。
