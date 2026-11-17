@@ -1,0 +1,1162 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import re
+import shutil
+from pathlib import Path
+from typing import Any
+
+from sortie_deck import observability as obs
+from sortie_deck.models import RepoConfig, StageContext, StageResult
+
+logger = logging.getLogger(__name__)
+
+# 同一 mission 的并行波次可能同时准备同名仓库（两个角色都绑了 monorepo）：
+# 按 checkout 绝对路径做进程内串行，避免「两边都判断 .git 不存在 → 同时 clone」
+# 导致后到的一方直接失败。多进程部署下每个 mission 目录独立，不存在跨进程竞争。
+_CLONE_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _clone_lock(target: Path) -> asyncio.Lock:
+    key = str(target.absolute())
+    lock = _CLONE_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _CLONE_LOCKS[key] = lock
+    return lock
+
+# 这些 flag 后面跟的是凭据，入 span 前要打码
+_SENSITIVE_FLAGS = {"--api-key", "--token", "--password", "--auth-token", "--secret"}
+_MAX_COMMAND_CHARS = 200
+
+_PERM_RE = re.compile(
+    r"(haven'?t granted|permission(?:s)? blocker|approve the (?:file-)?write|write permission|"
+    r"requested permissions to write|permission denied|needs? approval|"
+    r"授权|尚未授予|权限被拒绝|需要.*批准)",
+    re.IGNORECASE,
+)
+
+_AUTH_RE = re.compile(
+    r"(authentication required|please run ['\"]?agent login|CURSOR_API_KEY|"
+    r"not (?:logged|authenticated)|login required|unauthorized)",
+    re.IGNORECASE,
+)
+
+
+async def _mcp_prompt_and_log(ctx: StageContext) -> tuple[str, str]:
+    """When MCP runtime is on, list tools from bound MCP toolkit items and return prompt + log."""
+    from sortie_deck.settings import settings
+
+    if not settings.mcp_runtime or not ctx.toolkit_ids:
+        return "", ""
+    try:
+        from sortie_deck.mcp_runtime import McpSessionManager, resolve_mcp_items
+        from sortie_deck.orchestrator import _toolkit_store
+    except Exception:
+        return "", ""
+    items = resolve_mcp_items(_toolkit_store, list(ctx.toolkit_ids))
+    if not items:
+        return "", "MCP runtime on but no MCP toolkit items bound\n"
+    mgr = McpSessionManager()
+    try:
+        await mgr.open_for_items(items)
+        manifest = mgr.tools_manifest()
+        log = mgr.combined_log()
+        extra = ""
+        if manifest:
+            if bool(getattr(settings, "mcp_call_enabled", False)):
+                note = (
+                    "You may request a call: emit "
+                    '`StageResult.meta["mcp_calls"] = [{"tool": "...", "arguments": {...}}]` '
+                    "and the orchestrator will execute it (whitelist + write confirmation apply)."
+                )
+            else:
+                note = "Tool invocation is disabled — treat this as a read-only manifest."
+            extra = "\n\nAvailable MCP tools:\n" f"{manifest}\n" f"({note})\n"
+        return extra, log
+    finally:
+        await mgr.close_all()
+
+
+def _review_sections(ctx: StageContext, workspace: Path) -> tuple[str, str]:
+    """CLI 单发模式的「实现清单 + 静态自审」段落。
+
+    多轮续跑只在支持会话续接的 provider 上做（见 review_lens.run_review_lenses）；
+    CLI 执行器一次进程就结束，因此这里只把 lens 清单写进提示词，并在结束时
+    记一条 mode=static 的 review 日志，状态是 prompted 而不是 passed。
+    """
+    from sortie_deck.harness_providers.executor import _checklist_exec_section
+    from sortie_deck.review_lens import build_static_review_section, load_review_config
+
+    checklist = _checklist_exec_section(ctx, workspace)
+    cfg = load_review_config()
+    review = build_static_review_section(cfg.rounds) if cfg.enabled else ""
+    return checklist, review
+
+
+async def _extra_artifacts(
+    ctx: StageContext, workspace: Path, diff: str, *, harness: str
+) -> tuple[dict[str, str], dict[str, Any]]:
+    """CLI 执行器的可选产物 + 静态自审日志。
+
+    可选产物（checklist.md / selftest_log.json）存在就归档，缺失不报错；
+    自审日志写 ``logs/<stage>/review.json``，review.md 进阶段产物。
+    """
+    from sortie_deck.contracts import optional_artifacts
+    from sortie_deck.review_lens import (
+        build_scope,
+        load_review_config,
+        record_static_review,
+        stage_in_review_scope,
+    )
+
+    extra: dict[str, str] = {}
+    for name in optional_artifacts(ctx.stage):
+        path = workspace / name
+        if not path.is_file():
+            continue
+        try:
+            extra[name] = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            logger.warning("可选产物读取失败: %s", path, exc_info=True)
+
+    cfg = load_review_config()
+    if not (cfg.enabled and stage_in_review_scope(ctx.stage, cfg)):
+        return extra, {}
+    checklist = extra.get("checklist.md") or str(ctx.upstream_artifacts.get("checklist.md") or "")
+    scope = build_scope(ctx, diff, checklist, workspace=workspace)
+    data_dir = Path(ctx.data_dir) if ctx.data_dir else None
+    log = record_static_review(
+        ctx, scope, harness=harness, rounds=cfg.rounds, data_dir=data_dir
+    )
+    # 静态模式没有可验证的结论：只留 review.json 日志，不产出 review.md 假报告
+    return extra, {"review": log.summary()}
+
+
+def _which(cmd: str) -> str | None:
+    return shutil.which(cmd)
+
+
+def _coding_timeout() -> int:
+    from sortie_deck.settings import settings
+
+    return int(getattr(settings, "coding_timeout_seconds", 900) or 900)
+
+
+async def _artifact_brief_section(ctx: StageContext) -> tuple[str, str]:
+    """coding CLI 的上游产物段落：与 harness 共用「摘要 + 路径」口径。
+
+    返回 (prompt 段落, 日志行)；任何异常都回落旧的 PRD 全文，不影响阶段执行。
+    """
+    from sortie_deck.settings import settings
+
+    fallback = f"PRD:\n{ctx.upstream_artifacts.get('prd.md', ctx.brief)}\n"
+    if not settings.prompt_artifact_briefs or not ctx.upstream_artifacts:
+        return fallback, ""
+
+    try:
+        from sortie_deck.artifact_summary import build_artifact_briefs, render_artifact_briefs
+        from sortie_deck.mission_memory import get_mission_memory
+
+        briefs = await build_artifact_briefs(
+            ctx.upstream_artifacts,
+            ctx.upstream_paths,
+            mission_id=ctx.initiative_id,
+            max_tokens=settings.prompt_artifact_summary_max_tokens,
+            inline_chars=settings.prompt_inline_artifact_chars,
+            use_llm=settings.prompt_artifact_summary_llm,
+            timeout=settings.prompt_artifact_summary_timeout,
+            memory_dir=get_mission_memory().memory_dir(ctx.initiative_id),
+        )
+    except Exception:  # noqa: BLE001 — 摘要失败回落全文
+        logger.warning(
+            "coding 产物摘要失败，回落 PRD 全文: initiative=%s stage=%s",
+            ctx.initiative_id,
+            ctx.stage,
+            exc_info=True,
+        )
+        return fallback, "artifact_briefs=failed"
+
+    if not briefs:
+        return fallback, ""
+    section = (
+        "Upstream artifacts（只给摘要与路径；需要细节时自行 Read 对应路径，"
+        "不要凭文件名猜内容）:\n"
+        + render_artifact_briefs(briefs)
+        + "\n读取建议：只读与本阶段产出直接相关的 1-2 份，其余按需再取。\n"
+    )
+    return section, f"artifact_briefs={len(briefs)}"
+
+
+def _compact_env() -> dict[str, str]:
+    """coding CLI 子进程的上下文压缩窗口（与 harness 同一套配置）。"""
+    from sortie_deck.settings import settings
+
+    try:
+        window = int(settings.harness_auto_compact_window or 0)
+    except (TypeError, ValueError):
+        return {}
+    if window <= 0:
+        return {}
+    return {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(window)}
+
+
+def _write_mcp_config(workspace: Path, ctx: StageContext) -> tuple[str, list[str]]:
+    """把本阶段绑定的 MCP 落成 claude CLI 的 ``--mcp-config`` 文件。
+
+    返回 (配置文件路径, 说明行)；strict 关闭 / 无绑定 / 写盘失败时都返回空路径，
+    调用方据此退回 CLI 默认行为（读取用户级 MCP 配置）。
+    """
+    from sortie_deck.settings import settings
+
+    if not settings.harness_mcp_strict:
+        return "", ["MCP: strict 关闭，沿用 CLI 默认配置"]
+    try:
+        from sortie_deck.harness_providers.mcp_binding import mcp_servers_from_toolkit
+        from sortie_deck.orchestrator import _toolkit_store
+    except Exception:  # noqa: BLE001 — 工具箱不可用时按「无 MCP」处理
+        logger.warning("coding MCP 绑定跳过：依赖不可用", exc_info=True)
+        return "", ["MCP: 依赖不可用，未挂载"]
+
+    servers, notes = mcp_servers_from_toolkit(_toolkit_store, list(ctx.toolkit_ids))
+    path = workspace / ".tdt" / "mcp-config.json"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"mcpServers": servers}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        logger.warning("MCP 配置文件写入失败（忽略）: %s", path, exc_info=True)
+        return "", [*notes, "MCP: 配置写入失败，未挂载"]
+    return str(path), notes
+
+
+def _permission_mode(ctx: StageContext) -> str:
+    """解析本阶段的 Claude Code 权限模式（CLI 执行器路径）。
+
+    HITL 放行权限阻断后会在指令里注入 ``[sortie:coding_permission_mode=...]``；
+    解析统一走 ``permissions.resolve_permission_mode``，与 SDK harness 路径同口径。
+    """
+    from sortie_deck.permissions import resolve_permission_mode
+    from sortie_deck.settings import settings
+
+    return resolve_permission_mode(
+        permissions=ctx.permissions,
+        human_instruction=ctx.human_instruction,
+        default=getattr(settings, "coding_permission_mode", "acceptEdits"),
+    )
+
+
+def _looks_like_permission_block(text: str) -> bool:
+    return bool(_PERM_RE.search(text or ""))
+
+
+def _looks_like_auth_block(text: str) -> bool:
+    return bool(_AUTH_RE.search(text or ""))
+
+
+def _safe_command(args: list[str]) -> str:
+    """命令行转成可入 span 的字符串：敏感 flag 的值打码后截断。
+
+    coding CLI 的 ``-p`` 参数是整段 prompt，截断后仍能看出调的是哪个 CLI；
+    真正的输出在产物文件里，不需要也不应该把 stdout 塞进 trace。
+    """
+    parts: list[str] = []
+    hide_next = False
+    for arg in args:
+        if hide_next:
+            parts.append("***")
+            hide_next = False
+            continue
+        parts.append(arg)
+        if arg in _SENSITIVE_FLAGS:
+            hide_next = True
+    return obs.truncate(" ".join(parts), _MAX_COMMAND_CHARS)
+
+
+async def _run_cmd(
+    args: list[str],
+    cwd: Path,
+    timeout: int | None = None,
+    *,
+    extra_env: dict[str, str] | None = None,
+) -> tuple[int, str, str]:
+    """执行子进程——coding executor 的唯一子进程出口（含 git diff 等辅助命令）。
+
+    CLI 内部行为不可观测，能记的只有命令行、耗时、退出码；这三项足以回答
+    「阶段慢在哪个命令」「exit=124 是超时还是任务本身失败」。
+    """
+    timeout = timeout if timeout is not None else _coding_timeout()
+    with obs.span(
+        "process.exec",
+        **{
+            "process.command": _safe_command(args),
+            "process.cwd": str(cwd),
+            "sortie.timeout_seconds": timeout,
+        },
+    ) as proc_span:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            cwd=str(cwd),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            # CI=1 让 CLI 走非交互；extra_env 用于注入上下文压缩窗口等增量配置
+            env={**os.environ, "CI": "1", **(extra_env or {})},
+        )
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            # 超时是「转成返回值的失败」（返回码 124 而非抛异常），必须显式标 ERROR
+            obs.mark_failure(proc_span, f"timeout after {timeout}s")
+            return 124, "", f"Timeout after {timeout}s"
+        code = proc.returncode or 0
+        obs.set_attributes(proc_span, {"sortie.exit_code": code})
+        if code != 0:
+            obs.mark_failure(proc_span, f"exit code {code}")
+        return code, stdout_b.decode("utf-8", errors="replace"), stderr_b.decode(
+            "utf-8", errors="replace"
+        )
+
+
+async def _git_toplevel(path: Path) -> Path | None:
+    """返回 path 所属 git 仓库的顶层目录；不是仓库（或目录不存在）时返回 None。
+
+    单独抽出来的原因：git 在子目录执行会向上回溯父仓库，必须显式拿到 toplevel
+    才能判断「这个目录自己是不是仓库」。只有 toplevel 恰好等于目录本身，才说明
+    该目录是仓库根；否则说明它嵌在别的仓库里。
+    """
+    if not path.exists():
+        return None
+    code, out, _err = await _run_cmd(
+        ["git", "rev-parse", "--show-toplevel"], cwd=path, timeout=10
+    )
+    if code != 0:
+        return None
+    raw = (out or "").strip()
+    if not raw:
+        return None
+    try:
+        return Path(raw).resolve()
+    except OSError:
+        return None
+
+
+def _workspace_file_listing(workspace: Path) -> str:
+    """无 git 时的兜底：列出 agent 写过的文件（只有文件名，没有增删行）。
+
+    .upstream / .archive 是编排层注入的上游镜像与遗留归档，不是 agent 产出，
+    混进来会让 diff.patch 出现「上游文件被当成实现」的假改动。
+    依赖与缓存目录（__pycache__ / node_modules 等）同样不是手写实现，
+    列进来会挤占 80 个文件名额，还会把 .pyc 之类噪音带进自审范围；
+    口径与 _count_impl_files 的 skip 集合保持一致。
+    """
+    excluded = {
+        ".upstream",
+        ".archive",
+        ".git",
+        "__pycache__",
+        "node_modules",
+        # 任务内依赖/构建产物：沙箱方案允许装在 workspace，但不能算手写实现
+        ".venv",
+        "venv",
+        "dist",
+        "build",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".next",
+        ".cursor",
+        ".sortie-deck",
+        ".write_probe",
+    }
+    files = [
+        p
+        for p in workspace.rglob("*")
+        if p.is_file()
+        and p.name != "README.md"
+        and not (excluded & set(p.relative_to(workspace).parts))
+    ]
+    if not files:
+        return "# (no git repository)\n"
+    listing = "\n".join(f"+ {p.relative_to(workspace)}" for p in sorted(files)[:80])
+    return f"# worktree files (no git)\n{listing}\n"
+
+
+async def _git_diff(
+    workspace: Path, repo_root: Path | None = None, repos: list[RepoConfig] | None = None
+) -> str:
+    """采集 agent 本阶段的代码改动，供 diff.patch 与自审范围复用。
+
+    三路来源依次拼接：
+    1. 沙盒自身是 git 仓库根 → ``git diff``（有增删行）；
+    2. 否则走影子仓 ``.shadow.git`` 的 diff（见 ``shadow_git``；覆盖 ``repos/`` 下
+       从 0 写的代码，但跳过已存在 ``.git`` 的 clone），影子仓不可用时回退文件清单；
+    3. 绑定了 mission repos → 每个 clone 再单独 ``git diff``，业务代码落在这里。
+
+    ``repo_root`` 仅为兼容旧签名保留，不参与任何判定。历史实现用
+    ``(repo_root / ".git").exists()`` 判断 has_git，但 repo_root 指向宿主机仓库，
+    mission 沙盒（data/missions/<id>/workspace）通常嵌在它下面，git 会向上回溯，
+    diff 出来的是编排器自己的未提交改动，与 agent 产出无关（2026-11-05 实测：
+    贪吃蛇任务的 diff.patch 里全是 sortie-deck 主仓库改动，自审也因此审错对象）。
+    """
+    if not _which("git"):
+        return "# (git not available)\n"
+
+    parts: list[str] = []
+    toplevel = await _git_toplevel(workspace)
+    # 必须 toplevel 恰好等于沙盒本身：等于父目录说明沙盒嵌在别的仓库里，
+    # 此时 git diff 拿到的是那个仓库的改动，宁可按「无 git」处理。
+    if toplevel is not None and toplevel == workspace.resolve():
+        _code, out, err = await _run_cmd(
+            ["git", "diff", "--no-ext-diff"], cwd=workspace, timeout=60
+        )
+        parts.append(out or err or "# (empty diff)\n")
+    else:
+        # 无项目 git：优先用影子仓的真实 diff
+        from sortie_deck.shadow_git import ShadowRepo
+
+        shadow_diff = await ShadowRepo(workspace).capture()
+        if shadow_diff:
+            parts.append(shadow_diff)
+        else:
+            # 影子仓不可用（None）或本阶段确实无改动（"")：保持旧行为退化成文件清单。
+            # 不能用「空 diff」冒充结论：改动可能全部落在被排除的 clone 里（如 agent 已 git add），
+            # 此时清单至少能让下游看到产出面。
+            parts.append(_workspace_file_listing(workspace))
+
+    # Mission repos cloned under workspace/repos: collect per-repo diffs too。
+    # 与上面分支独立：绑定仓库的任务，沙盒本身通常不是 git 仓库，
+    # 只走文件清单会拿不到业务代码的增删行。
+    for repo in repos or []:
+        target = workspace / "repos" / _repo_dirname(repo)
+        if not (target / ".git").exists():
+            continue
+        _rcode, rout, rerr = await _run_cmd(
+            ["git", "diff", "--no-ext-diff"], cwd=target, timeout=60
+        )
+        rdiff = rout or rerr or ""
+        if rdiff.strip():
+            parts.append(f"\n# diff in repo {target.name}\n{rdiff}\n")
+    return "".join(parts)
+
+
+def _stage_allows_commit(stage: str) -> bool:
+    """本阶段是否允许 agent 提交代码。
+
+    编码阶段（ENG_BUILD_STAGES）必须禁止：阶段收尾用 ``git diff`` 采 diff.patch
+    与自审范围，一旦 agent 提交，工作区变干净，diff 直接为空。自测 / QA 阶段允许
+    按修复粒度提交（一个修复一次提交），它们不依赖 diff 采集。
+    """
+    from sortie_deck.models import ENG_BUILD_STAGES
+
+    return str(stage or "") not in ENG_BUILD_STAGES
+
+
+def _repo_dirname(repo: RepoConfig) -> str:
+    """Checkout dir name for a repo: explicit name → url basename minus .git."""
+    if repo.name:
+        return repo.name
+    base = repo.url.rstrip("/").split("/")[-1]
+    if base.endswith(".git"):
+        base = base[: -len(".git")]
+    return base or "repo"
+
+
+def _clone_url(repo: RepoConfig) -> str:
+    """@deprecated 返回不带凭据的裸 URL。
+
+    旧实现把 ``RepoConfig.token`` 拼成 ``https://token@host/...``，会让密钥
+    出现在命令行、``ps`` 与 ``process.command`` span 里。凭据改由
+    ``build_askpass_env()`` 经环境变量注入（见 git_cred）。
+    """
+    if repo.token:
+        logger.warning("RepoConfig.token 已废弃，请改用 git 凭据（source/credential_id）")
+    return repo.url
+
+
+async def clone_repos(
+    repos: list[RepoConfig],
+    workspace: Path,
+    initiative_id: str = "",
+    *,
+    actor_user_id: str = "",
+    resolver: Any | None = None,
+    allow_commit: bool = False,
+) -> tuple[str, list[str]]:
+    """Clone each mission repo into ``workspace/repos/<name>`` before coding.
+
+    Returns ``(prompt_section, log_lines)``. Already-present checkouts are
+    kept (idempotent on retry); clone failures are logged but do not abort the
+    stage — the agent is told which checkouts exist.
+
+    任务分支策略：clone 成功后基于目标分支 HEAD 创建任务分支
+    ``sortie/<initiative_id>-<repo>``（见 git_publish.mission_branch），
+    所有阶段都在该分支上迭代，最后由 git_publish 推送并建 MR。分支幂等：
+    已存在则复用（重试场景）。
+
+    提交策略（``allow_commit``）：编码阶段必须为 ``False`` —— 改动留在工作区，
+    阶段收尾才能用 ``git diff`` 采到 diff.patch 与自审范围；自测 / QA 阶段为
+    ``True``，允许「修一个问题提交一次」，便于返工时定位。两个阶段都不 push。
+
+    凭据：``resolver`` 按仓库来源解析凭据（工作区仓库→工作区凭据，
+    custom→actor 的个人凭据），HTTPS 走 askpass env 注入，密钥不进命令行。
+    ``actor_user_id`` 为空时视为无需凭据（公开仓库 / 单测），不访问凭据库。
+
+    磁盘水位防护：可用空间低于 ``TDT_MIN_DISK_FREE_MB`` 时跳过 clone 并在
+    prompt/log 中说明，防止极端并发打爆服务器磁盘。
+    """
+    # 真实编码阶段只传 actor_user_id，不传 resolver；这里按 repo_id 回查注册表，
+    # 与 publish_repos 保持一致，避免 clone 依赖容器内残留的 ssh/凭据环境。
+    if resolver is None and actor_user_id:
+        try:
+            from sortie_deck.git_cred import resolver_from_settings
+
+            resolver = resolver_from_settings()
+        except Exception:  # noqa: BLE001 — 凭据库不可用时按无凭据方式 clone（公开仓库）
+            logger.warning("git 凭据库不可用，clone 将以无凭据方式执行", exc_info=True)
+
+    if not repos:
+        # 未绑定仓库：repos/ 约定为统一产出目录（任务终态打包归档到
+        # artifacts/code-archive/，见 workspace.archive_repos_snapshot）。
+        # 不预创建并在 prompt 里说明的话，agent 会把代码散落沙盒根，回收时全部丢失。
+        out_dir = workspace / "repos"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        section = (
+            "\n\nNo git repositories are bound to this mission.\n"
+            f"Write ALL implementation code into `{out_dir}` (already created): every\n"
+            "code file, script and static asset must live under that directory — it is\n"
+            "archived to the mission artifacts when the mission finishes; files written\n"
+            "outside it may be lost.\n"
+        )
+        # 无绑仓任务同样需要基线：agent 会把代码写进 repos/，自审靠影子仓拿 diff
+        await _shadow_baseline(workspace)
+        return section, ["mission_repos=0 (no repos; output dir repos/ prepared)"]
+    repos_root = workspace / "repos"
+    repos_root.mkdir(parents=True, exist_ok=True)
+    log: list[str] = [f"mission_repos={len(repos)}"]
+
+    # 磁盘水位防护（云上多用户安全阀）
+    from sortie_deck.git_publish import mission_branch
+    from sortie_deck.settings import settings as _settings
+
+    free_mb = -1
+    try:
+        import shutil as _shutil
+
+        free_mb = int(_shutil.disk_usage(str(workspace)).free / (1024 * 1024))
+    except OSError:
+        pass
+    min_free = int(getattr(_settings, "min_disk_free_mb", 0) or 0)
+    if min_free > 0 and 0 <= free_mb < min_free:
+        log.append(f"DISK GUARD: free={free_mb}MB < min_disk_free_mb={min_free}MB, clone skipped")
+        section = (
+            "\n\nMission code repositories: NOT AVAILABLE this run — the server is low on "
+            f"disk (free {free_mb}MB < required {min_free}MB). Clones were skipped; do not "
+            "attempt file writes into repos/ and report this limitation.\n"
+        )
+        return section, log
+
+    # 未显式传 resolver 时按全局配置构造（actor 为空说明无需个人凭据，避免单测碰到真实库）
+    if resolver is None and actor_user_id:
+        try:
+            from sortie_deck.git_cred import resolver_from_settings
+
+            resolver = resolver_from_settings()
+        except Exception:  # noqa: BLE001 — 凭据库不可用时仍可克隆公开仓库
+            logger.warning("git 凭据库不可用，clone 将以无凭据方式执行", exc_info=True)
+
+    entries: list[str] = []
+    branch_notes: list[str] = []
+    for repo in repos:
+        target = repos_root / _repo_dirname(repo)
+        display = repo.branch or "(default branch)"
+        # 并行波次可能同时准备同名仓库：按 checkout 路径串行，避免重复 clone 冲突
+        async with _clone_lock(target):
+            if (target / ".git").exists():
+                log.append(f"repo {target.name}: reuse existing checkout")
+            elif _which("git"):
+                # --no-single-branch 必须显式给：--depth 默认隐含 --single-branch，只拉基线分支。
+                # 工作副本在 push 后会被回收（git_cleanup_after_push），下一阶段重新 clone
+                # 时若看不到任务分支，就会从基线重建同名分支并与远端已有提交分叉，
+                # push 直接 non-fast-forward。
+                args = ["git", "clone", "--depth", "50", "--no-single-branch"]
+                if repo.branch:
+                    args += ["--branch", repo.branch]
+                args += [_clone_url(repo), str(target)]
+
+                git_ctx = None
+                extra_env: dict[str, str] = {}
+                if resolver is not None:
+                    from sortie_deck.git_cred import build_askpass_env, build_ssh_env
+
+                    try:
+                        resolved = resolver.resolve(repo, actor_user_id=actor_user_id)
+                    except Exception as exc:  # noqa: BLE001 — 单仓凭据失败不阻断其它仓库
+                        log.append(f"repo {target.name}: credential unavailable ({exc})")
+                        entries.append(
+                            f"- `{target}` — CHECKOUT SKIPPED: git credential unavailable"
+                        )
+                        continue
+                    if resolved.scheme == "https":
+                        git_ctx = build_askpass_env(
+                            username=resolved.username,
+                            secret=resolved.secret,
+                            workdir=workspace,
+                        )
+                        extra_env = git_ctx.env
+                    else:
+                        # SSH：私钥写任务沙盒临时文件，随 git_ctx 退出删除
+                        git_ctx = build_ssh_env(secret=resolved.secret, workdir=workspace)
+                        extra_env = git_ctx.env
+                        log.append(f"repo {target.name}: ssh key injected")
+                try:
+                    code, out, err = await _run_cmd(args, cwd=workspace, extra_env=extra_env)
+                finally:
+                    if git_ctx is not None:
+                        git_ctx.__exit__()
+                log.append(f"repo {target.name}: clone exit={code}")
+                if code != 0:
+                    log.append(f"clone stderr={(err or out)[:500]}")
+                else:
+                    # clone 成功后把 origin 换成无 token 的干净 URL，避免凭证落盘 .git/config
+                    #（push 时用带 token 的完整 URL，见 git_publish._push_branch）
+                    await _run_cmd(
+                        ["git", "remote", "set-url", "origin", repo.url], cwd=target, timeout=15
+                    )
+            else:
+                log.append(f"repo {target.name}: git not available, clone skipped")
+            if (target / ".git").exists():
+                task_branch = mission_branch(
+                    initiative_id, _repo_dirname(repo), multi_repo=len(repos) > 1
+                )
+                # 复用顺序：本地分支 → 远端跟踪分支 → 新建。
+                # 不能直接用 `rev-parse --verify <name>`：它不解析 refs/remotes/*，
+                # 会把上一阶段已 push 的任务分支误判为不存在，随后从基线重建导致分叉。
+                code, _, _ = await _run_cmd(
+                    ["git", "rev-parse", "--verify", f"refs/heads/{task_branch}"],
+                    cwd=target,
+                    timeout=15,
+                )
+                if code == 0:
+                    await _run_cmd(["git", "checkout", task_branch], cwd=target, timeout=15)
+                    log.append(f"repo {target.name}: task branch reused={task_branch}")
+                else:
+                    code, _, _ = await _run_cmd(
+                        ["git", "rev-parse", "--verify", f"refs/remotes/origin/{task_branch}"],
+                        cwd=target,
+                        timeout=15,
+                    )
+                    if code == 0:
+                        code, _, cerr = await _run_cmd(
+                            ["git", "checkout", "-b", task_branch, f"origin/{task_branch}"],
+                            cwd=target,
+                            timeout=15,
+                        )
+                        log.append(
+                            f"repo {target.name}: task branch restored from origin="
+                            f"{task_branch} exit={code}"
+                            + (f" stderr={cerr[:200]}" if code != 0 else "")
+                        )
+                    else:
+                        code, _, cerr = await _run_cmd(
+                            ["git", "checkout", "-b", task_branch], cwd=target, timeout=15
+                        )
+                        log.append(
+                            f"repo {target.name}: task branch created={task_branch} exit={code}"
+                            + (f" stderr={cerr[:200]}" if code != 0 else "")
+                        )
+                entries.append(f"- `{target}` (base: {display}, working branch: `{task_branch}`)")
+                branch_notes.append(f"{target.name}: `{task_branch}`")
+            else:
+                entries.append(f"- `{target}` (branch: {display}) — CHECKOUT FAILED, see log")
+    section = (
+        "\n\nMission code repositories (read these first, then iterate on them):\n"
+        + "\n".join(entries)
+        + "\nExplore the code, implement the PRD changes inside these checkouts.\n"
+    )
+    if branch_notes:
+        if allow_commit:
+            # 自测 / QA 阶段：允许按修复粒度提交，便于返工时看清「哪次提交修的哪个问题」
+            section += (
+                "\nIMPORTANT — you are working on the mission's task branch; commit each fix:\n"
+                + "\n".join(f"- {note}" for note in branch_notes)
+                + "\nCommit once per fixed problem with a message naming the case or symptom,"
+                " but never `git push` — the orchestrator pushes and opens the MR.\n"
+            )
+        else:
+            # 编码阶段：改动必须留在工作区，否则阶段收尾的 git diff 采不到任何代码，
+            # diff.patch 与多镜头自审范围会一起落空（2026-11-06 贪吃蛇任务实测）。
+            section += (
+                "\nIMPORTANT — you are working on the mission's task branch,"
+                " but do NOT run `git commit` / `git push` in this stage:\n"
+                + "\n".join(f"- {note}" for note in branch_notes)
+                + "\nKeep every change in the working tree; the orchestrator captures"
+                " `diff.patch` and commits after QA. Committing here makes the stage diff"
+                " empty, so the self-review and the diff artifact silently lose all code.\n"
+            )
+    # clone 完成后再打基线：agent 首轮编辑之前的工作区状态才是本阶段 diff 的起点
+    await _shadow_baseline(workspace)
+    return section, log
+
+
+async def _shadow_baseline(workspace: Path) -> None:
+    """给无 git 的工作区打影子仓基线；失败只告警，不影响 clone 结果。"""
+    try:
+        from sortie_deck.shadow_git import ensure_shadow_baseline
+
+        await ensure_shadow_baseline(workspace)
+    except Exception:  # noqa: BLE001 — 影子仓是旁路能力，不阻断阶段
+        logger.warning("影子仓 baseline 失败 workspace=%s", workspace, exc_info=True)
+
+
+
+
+
+def ensure_worktree(repo_root: Path, initiative_id: str, worktrees_root: Path) -> Path:
+    """创建任务沙盒目录（纯普通目录，git worktree 语义已移除）。
+
+    历史行为是从服务器自身仓库做 ``git worktree add`` + ``tdt/<id>`` 分支——
+    与用户业务项目无关且在云上多用户下有并发竞态，已废弃。业务代码统一走
+    mission repos 的 per-task clone（``workspace/repos/<name>``，由 ``clone_repos``
+    落在沙盒下），沙盒本身只是编码 agent 的工作目录。
+
+    repo_root 参数保留仅为兼容旧调用签名，不再参与任何 git 操作。
+    路径布局：``worktrees_root/<initiative_id>/workspace``（worktrees_root 传 missions 根）。
+    """
+    target = worktrees_root / initiative_id / "workspace"
+    target.mkdir(parents=True, exist_ok=True)
+    readme = target / "README.md"
+    if not readme.exists():
+        readme.write_text(
+            f"# Workspace for {initiative_id}\n"
+            f"Isolated mission sandbox. Mission repos are cloned under `repos/`.\n"
+            f"Branch data lives on the remote git server (GitLab); this directory is a\n"
+            f"disposable working copy and may be reclaimed after a successful push.\n",
+            encoding="utf-8",
+        )
+    return target
+
+
+def _count_impl_files(workspace: Path, *, has_repos: bool = False) -> int:
+    """统计 agent 写的实现文件数（「exit=0 但没写代码」失败判定的依据）。
+
+    has_repos=True（绑定仓库）时排除 repos/（业务 clone，非 agent 产出）；
+    未绑定时 repos/ 是约定产出目录（见 clone_repos），必须计入。
+    .cursor / .sortie-deck 是知识包注入产物，不是 agent 写的实现文件；
+    不排除会让「exit=0 但没写代码」的失败判定永远不触发。
+    """
+    skip = {
+        ".git",
+        "__pycache__",
+        "node_modules",
+        ".write_probe",
+        ".cursor",
+        ".sortie-deck",
+        # 编排层注入目录：上游镜像与跨阶段遗留归档，不能算成 agent 写的实现文件
+        ".upstream",
+        ".archive",
+    }
+    if has_repos:
+        skip.add("repos")
+    n = 0
+    for p in workspace.rglob("*"):
+        if not p.is_file():
+            continue
+        if any(part in skip for part in p.parts):
+            continue
+        if p.name == "README.md":
+            continue
+        n += 1
+    return n
+
+
+def _resolve_cursor_binary() -> tuple[str | None, list[str]]:
+    """Return (binary, prefix_args) for Cursor Agent CLI.
+
+    Only `cursor-agent` / `agent` count. The IDE shim `cursor` (→ code) is NOT
+    a headless Agent CLI and will hang or no-op on `-p` — treat as missing.
+    """
+    for name in ("cursor-agent", "agent"):
+        path = _which(name)
+        if path:
+            return path, []
+    return None, []
+
+
+class ClaudeCodeExecutor:
+    """Adapter for Claude Code CLI (`claude`) with worktree write permissions."""
+
+    name = "claude_code"
+
+    def __init__(self, repo_root: Path, worktrees_root: Path) -> None:
+        self.repo_root = repo_root
+        self.worktrees_root = worktrees_root
+
+    def probe(self) -> dict[str, str]:
+        claude = _which("claude")
+        if not claude:
+            return {"status": "missing", "detail": "claude not on PATH"}
+        from sortie_deck.settings import settings
+
+        mode = getattr(settings, "coding_permission_mode", "acceptEdits")
+        return {"status": "ok", "detail": f"{claude} · permission-mode={mode}"}
+
+    async def run(self, ctx: StageContext) -> StageResult:
+        workspace = ensure_worktree(self.repo_root, ctx.initiative_id, self.worktrees_root)
+        artifact_section, brief_log = await _artifact_brief_section(ctx)
+        mcp_extra, mcp_log = await _mcp_prompt_and_log(ctx)
+        repo_section, repo_log = await clone_repos(
+            ctx.repos,
+            workspace,
+            ctx.initiative_id,
+            actor_user_id=ctx.actor_user_id,
+            allow_commit=_stage_allows_commit(ctx.stage),
+        )
+        checklist_section, review_section = _review_sections(ctx, workspace)
+        mode = _permission_mode(ctx)
+        prompt = (
+            f"{ctx.persona}\n\n"
+            f"You are running inside an isolated Sortie Deck worktree. You MAY create/edit files here.\n"
+            f"Workspace (cwd): {workspace}\n"
+            f"Write the implementation into this directory (e.g. index.html / src/).\n"
+            f"Do not ask the user to approve writes — permission mode is `{mode}`.\n"
+            "Install project dependencies inside this workspace only (node_modules/.venv); "
+            "global installs (npm i -g, apt-get) are out of scope.\n"
+            f"Human instruction: {ctx.human_instruction or 'none'}\n\n"
+            f"{artifact_section}"
+            f"{repo_section}"
+            f"{mcp_extra}"
+            f"{checklist_section}"
+            f"{review_section}"
+        )
+        claude = _which("claude")
+        log_parts: list[str] = []
+        if brief_log:
+            log_parts.append(brief_log)
+        if repo_log:
+            log_parts.append("\n".join(repo_log))
+        if mcp_log:
+            log_parts.append(mcp_log)
+        ok = False
+        needs_perm = False
+        if claude:
+            args = [
+                claude,
+                "-p",
+                prompt,
+                "--output-format",
+                "text",
+                "--permission-mode",
+                mode,
+                "--add-dir",
+                str(workspace),
+            ]
+            if mode == "bypassPermissions":
+                args.append("--dangerously-skip-permissions")
+            # 严格模式：只挂本阶段绑定的 MCP，切断用户级 mcpServers 的全量注入
+            mcp_config, mcp_notes = _write_mcp_config(workspace, ctx)
+            if mcp_config:
+                args.extend(["--mcp-config", mcp_config, "--strict-mcp-config"])
+            if mcp_notes:
+                log_parts.append("MCP: " + "; ".join(mcp_notes))
+            log_parts.append(f"cmd={' '.join(args[:4])} … --permission-mode {mode}")
+            code, out, err = await _run_cmd(args, cwd=workspace, extra_env=_compact_env())
+            combined = f"{out}\n{err}"
+            log_parts.append(f"exit={code}\n{combined[:3500]}")
+            needs_perm = _looks_like_permission_block(combined)
+            wrote = _count_impl_files(workspace, has_repos=bool(ctx.repos))
+            ok = code == 0 and not needs_perm and (wrote > 0 or "DONE" in combined.upper())
+            if code == 0 and wrote == 0 and not needs_perm:
+                # Succeeded textually but no files — treat as soft fail for Teams loop
+                ok = False
+                log_parts.append("WARN: exit=0 but worktree has no implementation files")
+        else:
+            msg = (
+                "Claude Code CLI (`claude`) not found on PATH. "
+                "Install from https://docs.anthropic.com/en/docs/claude-code and retry."
+            )
+            log_parts.append(msg)
+
+        diff = await _git_diff(workspace, self.repo_root, ctx.repos)
+        extra_artifacts, review_meta = await _extra_artifacts(
+            ctx, workspace, diff, harness=self.name
+        )
+        tasks = {
+            "tasks": [
+                {
+                    "id": "T1",
+                    "title": "Claude Code implementation",
+                    "status": "done" if ok else ("needs_permission" if needs_perm else "failed"),
+                }
+            ],
+            "workspace": str(workspace),
+            "permission_mode": mode,
+            "files_written": _count_impl_files(workspace, has_repos=bool(ctx.repos)),
+            "repos": [
+                {"url": r.url, "branch": r.branch or "default", "name": _repo_dirname(r)}
+                for r in ctx.repos
+            ],
+        }
+        implementation = f"""# Claude Code run
+
+Workspace: `{workspace}`
+Available CLI: `{bool(claude)}`
+Permission mode: `{mode}`
+
+## Log
+{chr(10).join(log_parts)[:4000]}
+"""
+        artifacts = {
+            "implementation.md": implementation,
+            "tasks.json": json.dumps(tasks, ensure_ascii=False, indent=2),
+            "diff.patch": diff,
+            **extra_artifacts,
+        }
+        if needs_perm:
+            return StageResult(
+                status="needs_hitl",
+                message=(
+                    "编码 Agent 需要写 worktree 权限。"
+                    "请在门禁点「放行」以 bypass 权限重试，或在本机 Claude 设置中信任该目录。"
+                ),
+                artifacts=artifacts,
+                proposed_next=ctx.stage,
+                meta={
+                    "workspace": str(workspace),
+                    "permission_block": True,
+                    "permission_mode": mode,
+                    "retry_permission_mode": "bypassPermissions",
+                    **review_meta,
+                },
+            )
+
+        fail_message = (
+            "Claude Code CLI not found; install `claude` and retry"
+            if not claude
+            else "Claude Code 未写出代码或执行失败（见 implementation.md）"
+        )
+        return StageResult(
+            status="ok" if ok else "fail",
+            message="Claude Code stage finished" if ok else fail_message,
+            artifacts=artifacts,
+            proposed_next="qa_verify" if ok else ctx.stage,
+            meta={"workspace": str(workspace), "permission_mode": mode, **review_meta},
+        )
+
+
+class CursorCliExecutor:
+    """Adapter for Cursor Agent CLI (`cursor-agent`, `agent`, or `cursor agent`)."""
+
+    name = "cursor_cli"
+
+    def __init__(self, repo_root: Path, worktrees_root: Path) -> None:
+        self.repo_root = repo_root
+        self.worktrees_root = worktrees_root
+
+    def probe(self) -> dict[str, str]:
+        binary, prefix = _resolve_cursor_binary()
+        if not binary:
+            ide = _which("cursor")
+            detail = (
+                "cursor-agent / agent not on PATH. "
+                "Install: curl -sS https://cursor.com/install | bash "
+                "(IDE `cursor` alone is not enough)."
+            )
+            if ide:
+                detail += f" Found IDE shim at {ide}."
+            return {"status": "missing", "detail": detail}
+        label = " ".join([binary, *prefix]).strip()
+        from sortie_deck.llm import _cursor_agent_ready
+
+        if not _cursor_agent_ready():
+            return {
+                "status": "auth_required",
+                "detail": f"{label} · run `cursor-agent login` or set CURSOR_API_KEY",
+            }
+        return {"status": "ok", "detail": label}
+
+    async def run(self, ctx: StageContext) -> StageResult:
+        workspace = ensure_worktree(self.repo_root, ctx.initiative_id, self.worktrees_root)
+        # prd 仅用于知识库检索（检索需要原文），prompt 里走「摘要 + 路径」
+        prd = ctx.upstream_artifacts.get("prd.md", ctx.brief)
+        artifact_section, brief_log = await _artifact_brief_section(ctx)
+        repo_section, repo_log = await clone_repos(
+            ctx.repos,
+            workspace,
+            ctx.initiative_id,
+            actor_user_id=ctx.actor_user_id,
+            allow_commit=_stage_allows_commit(ctx.stage),
+        )
+        checklist_section, review_section = _review_sections(ctx, workspace)
+        query = f"{ctx.brief}\n{prd}\n{ctx.human_instruction or ''}"
+        kb_meta: dict[str, str] = {}
+        try:
+            from sortie_deck.knowledge_gateway import gateway_from_settings
+            from sortie_deck.knowledge_pack import load_pack_for_cursor
+            from sortie_deck.settings import settings as _settings
+
+            gw = gateway_from_settings(_settings)
+            # 知识包除 workspace（供 Cursor 自动加载）外，再归档一份到任务目录，
+            # 否则 workspace 回收后无法追溯「当时给 agent 灌了什么」。
+            mission_root = (
+                Path(ctx.data_dir) / "missions" / ctx.initiative_id if ctx.data_dir else None
+            )
+            kb_meta = load_pack_for_cursor(
+                gw.store, workspace, query, gateway=gw, mission_root=mission_root, stage=ctx.stage
+            )
+        except Exception as exc:  # noqa: BLE001 — soft-fail knowledge load
+            kb_meta = {"error": str(exc)}
+
+        mcp_extra, mcp_log = await _mcp_prompt_and_log(ctx)
+        inputs_hint = ""
+        if ctx.inputs:
+            from sortie_deck.mission_input import render_input_index
+
+            index_block = render_input_index(ctx.inputs)
+            if index_block:
+                inputs_hint = "\n" + index_block
+        kb_hint = ""
+        if kb_meta.get("rule"):
+            kb_hint = (
+                f"\nKnowledge pack loaded for this mission.\n"
+                f"- Follow Cursor rule: `{kb_meta['rule']}`\n"
+                f"- Full pack: `{kb_meta.get('pack', '')}` "
+                f"({kb_meta.get('hits', '0')} docs)\n"
+            )
+            if kb_meta.get("archive"):
+                kb_hint += f"- Mission archive: `{kb_meta['archive']}`\n"
+        prompt = (
+            f"{ctx.persona}\n\nImplement against PRD in this isolated worktree.\n"
+            f"Workspace: {workspace}\n"
+            f"You may create/edit files here without asking for write approval.\n"
+            f"Instruction: {ctx.human_instruction or 'none'}\n\n{artifact_section}"
+            f"{inputs_hint}"
+            f"{repo_section}"
+            f"{kb_hint}"
+            f"{mcp_extra}"
+            f"{checklist_section}"
+            f"{review_section}"
+        )
+        binary, prefix = _resolve_cursor_binary()
+        log_parts: list[str] = []
+        if brief_log:
+            log_parts.append(brief_log)
+        if repo_log:
+            log_parts.append("\n".join(repo_log))
+        if kb_meta:
+            log_parts.append(f"knowledge_pack={kb_meta}")
+        if mcp_log:
+            log_parts.append(mcp_log)
+        ok = False
+        needs_perm = False
+        needs_auth = False
+        if binary:
+            args = [binary, *prefix, "-p", prompt]
+            # cursor CLI 没有 --mcp-config，严格模式下本阶段就是「无 MCP」
+            log_parts.append("MCP: cursor CLI 不支持 --mcp-config，本阶段未挂载")
+            log_parts.append(f"cmd={' '.join(args[:4])}…")
+            code, out, err = await _run_cmd(args, cwd=workspace, extra_env=_compact_env())
+            combined = f"{out}\n{err}"
+            log_parts.append(f"exit={code}\n{combined[:3500]}")
+            needs_auth = _looks_like_auth_block(combined)
+            needs_perm = (not needs_auth) and _looks_like_permission_block(combined)
+            wrote = _count_impl_files(workspace, has_repos=bool(ctx.repos))
+            ok = code == 0 and not needs_perm and not needs_auth and wrote > 0
+            if code == 0 and wrote == 0 and not needs_perm and not needs_auth:
+                ok = False
+                log_parts.append("WARN: exit=0 but worktree has no implementation files")
+        else:
+            log_parts.append(
+                "Cursor Agent CLI not found. Install with:\n"
+                "  curl -sS https://cursor.com/install | bash\n"
+                "Ensure `cursor-agent` or `agent` is on PATH (IDE `cursor` alone is insufficient)."
+            )
+        log = "\n".join(log_parts)
+
+        diff = await _git_diff(workspace, self.repo_root, ctx.repos)
+        extra_artifacts, review_meta = await _extra_artifacts(
+            ctx, workspace, diff, harness=self.name
+        )
+        task_status = "done" if ok else (
+            "needs_auth" if needs_auth else ("needs_permission" if needs_perm else "failed")
+        )
+        tasks = {
+            "tasks": [
+                {
+                    "id": "T1",
+                    "title": "Cursor CLI implementation",
+                    "status": task_status,
+                }
+            ],
+            "workspace": str(workspace),
+            "files_written": _count_impl_files(workspace, has_repos=bool(ctx.repos)),
+            "repos": [
+                {"url": r.url, "branch": r.branch or "default", "name": _repo_dirname(r)}
+                for r in ctx.repos
+            ],
+        }
+        implementation = f"""# Cursor CLI run
+
+Workspace: `{workspace}`
+CLI: `{binary}` {' '.join(prefix)}
+
+## Log
+{log[:4000]}
+"""
+        artifacts = {
+            "implementation.md": implementation,
+            "tasks.json": json.dumps(tasks, ensure_ascii=False, indent=2),
+            "diff.patch": diff,
+            **extra_artifacts,
+        }
+        if needs_auth:
+            return StageResult(
+                status="needs_hitl",
+                message=(
+                    "Cursor Agent 未登录。"
+                    "请在本机运行 `cursor-agent login`（或设置 CURSOR_API_KEY），"
+                    "完成后在 Teams 回复 `/approve` 重试；也可改用 Claude Code。"
+                ),
+                artifacts=artifacts,
+                proposed_next=ctx.stage,
+                meta={
+                    "workspace": str(workspace),
+                    "permission_block": True,  # reuse Teams permission HITL copy + retry
+                    "auth_block": True,
+                    "retry_permission_mode": "bypassPermissions",
+                    "knowledge_pack": kb_meta,
+                    **review_meta,
+                },
+            )
+        if needs_perm:
+            return StageResult(
+                status="needs_hitl",
+                message="Cursor Agent 需要写 worktree 权限。请在门禁放行后重试，或检查 Cursor CLI 信任目录。",
+                artifacts=artifacts,
+                proposed_next=ctx.stage,
+                meta={
+                    "workspace": str(workspace),
+                    "permission_block": True,
+                    "retry_permission_mode": "bypassPermissions",
+                    "knowledge_pack": kb_meta,
+                    **review_meta,
+                },
+            )
+
+        fail_message = (
+            "Cursor CLI not found; install cursor-agent and retry"
+            if not binary
+            else "Cursor Agent 未写出代码或执行失败（见 implementation.md）"
+        )
+        return StageResult(
+            status="ok" if ok else "fail",
+            message="Cursor CLI stage finished" if ok else fail_message,
+            artifacts=artifacts,
+            proposed_next="qa_verify" if ok else ctx.stage,
+            meta={"workspace": str(workspace), "knowledge_pack": kb_meta, **review_meta},
+        )

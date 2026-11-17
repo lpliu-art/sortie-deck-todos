@@ -1,0 +1,201 @@
+"""编码阶段分支化测试：沙盒路径、clone→任务分支、prompt 注入、publish 触发与磁盘防护。"""
+
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from sortie_deck.graph import _maybe_publish
+from sortie_deck.models import RepoConfig, RoleId, StageContext, StageResult
+from sortie_deck.plugins.coding import (
+    _count_impl_files,
+    _stage_allows_commit,
+    clone_repos,
+    ensure_worktree,
+)
+from sortie_deck.settings import settings
+
+
+def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *args], cwd=str(cwd), capture_output=True, text=True, check=False, timeout=30
+    )
+
+
+@pytest.fixture
+def origin_repo(tmp_path: Path) -> Path:
+    work = tmp_path / "origin_work"
+    work.mkdir()
+    assert _git(work, "init", "-b", "main").returncode == 0
+    _git(work, "config", "user.email", "t@t")
+    _git(work, "config", "user.name", "t")
+    (work / "app.py").write_text("print('hi')\n", encoding="utf-8")
+    assert _git(work, "add", "-A").returncode == 0
+    assert _git(work, "commit", "-m", "init").returncode == 0
+    bare = tmp_path / "origin.git"
+    assert _git(tmp_path, "clone", "--bare", str(work), str(bare)).returncode == 0
+    return bare
+
+
+def test_ensure_worktree_sandbox_layout(tmp_path: Path):
+    """沙盒退化为普通目录：missions/<id>/workspace，不再有 git worktree/tdt 分支。"""
+    missions = tmp_path
+    ws = ensure_worktree(tmp_path, "ini_ws1", missions)
+    assert ws == missions / "ini_ws1" / "workspace"
+    assert ws.is_dir()
+    assert (ws / "README.md").is_file()
+    # 幂等：重复调用同一路径
+    assert ensure_worktree(tmp_path, "ini_ws1", missions) == ws
+    # 不是 git 仓库（无 worktree 语义）
+    assert not (ws / ".git").exists()
+
+
+@pytest.mark.anyio
+async def test_clone_prompt_commit_policy_by_stage(tmp_path: Path, origin_repo: Path):
+    """提交策略：编码阶段禁止提交（否则 diff 采集为空），自测 / QA 允许按修复提交。"""
+    repos = [RepoConfig(url=str(origin_repo), branch="main", name="repo")]
+
+    build_ws = ensure_worktree(tmp_path, "ini_policy_build", tmp_path)
+    build_section, _ = await clone_repos(
+        repos, build_ws, "ini_policy_build", allow_commit=False
+    )
+    assert "do NOT run `git commit`" in build_section
+    assert "commit each fix" not in build_section
+
+    qa_ws = ensure_worktree(tmp_path, "ini_policy_qa", tmp_path)
+    qa_section, _ = await clone_repos(repos, qa_ws, "ini_policy_qa", allow_commit=True)
+    assert "commit each fix" in qa_section
+    assert "do NOT run `git commit`" not in qa_section
+
+    assert _stage_allows_commit("eng_implement") is False
+    assert _stage_allows_commit("eng_backend") is False
+    assert _stage_allows_commit("eng_backend_selftest") is True
+    assert _stage_allows_commit("qa_verify") is True
+
+
+@pytest.mark.anyio
+async def test_clone_repos_without_repos_prepares_output_dir(tmp_path: Path):
+    """未绑定仓库：预创建 repos/ 统一产出目录，prompt 注入写入指引。
+
+    任务终态会把 repos/ 打包归档（workspace.archive_repos_snapshot），
+    agent 代码必须写进该目录才能被归档。
+    """
+    workspace = ensure_worktree(tmp_path, "ini_norepos", tmp_path)
+    section, log = await clone_repos([], workspace, "ini_norepos")
+    assert (workspace / "repos").is_dir()
+    assert "Write ALL implementation code" in section
+    assert str(workspace / "repos") in section
+    assert any("mission_repos=0" in line for line in log)
+
+
+def test_count_impl_files_repos_semantics(tmp_path: Path):
+    """实现文件计数按绑定与否区分 repos/ 语义：绑定时是 clone（排除），未绑定时是产出（计入）。"""
+    repos = tmp_path / "repos"
+    repos.mkdir(parents=True)
+    (repos / "app.py").write_text("x=1\n", encoding="utf-8")
+    (tmp_path / "README.md").write_text("r", encoding="utf-8")
+    # 绑定仓库：repos/ 是业务 clone，不计入
+    assert _count_impl_files(tmp_path, has_repos=True) == 0
+    # 未绑定：repos/ 是约定产出目录，计入；README 是沙盒说明，不计入
+    assert _count_impl_files(tmp_path, has_repos=False) == 1
+
+
+@pytest.mark.anyio
+async def test_clone_creates_task_branch_and_prompt(tmp_path: Path, origin_repo: Path):
+    ini = "ini_br1"
+    workspace = ensure_worktree(tmp_path, ini, tmp_path)
+    repos = [RepoConfig(url=str(origin_repo), branch="main", name="repo")]
+    section, log = await clone_repos(repos, workspace, ini)
+    clone = workspace / "repos" / "repo"
+    # 任务分支存在且已 checkout
+    assert _git(clone, "rev-parse", "--verify", f"sortie/{ini}-repo").returncode == 0
+    assert _git(clone, "symbolic-ref", "--short", "HEAD").stdout.strip() == f"sortie/{ini}-repo"
+    # prompt 与日志注入了任务分支信息
+    assert f"sortie/{ini}-repo" in section
+    assert any(f"task branch created=sortie/{ini}-repo" in line for line in log)
+    # 幂等重试：分支复用
+    section2, log2 = await clone_repos(repos, workspace, ini)
+    assert any(f"task branch reused=sortie/{ini}-repo" in line for line in log2)
+    # 多仓库命名：带仓库名后缀
+    repos2 = [
+        RepoConfig(url=str(origin_repo), branch="main", name="backend"),
+        RepoConfig(url=str(origin_repo), branch="main", name="web"),
+    ]
+    ws2 = ensure_worktree(tmp_path, "ini_br2", tmp_path)
+    await clone_repos(repos2, ws2, "ini_br2")
+    assert (
+        _git(ws2 / "repos" / "backend", "rev-parse", "--verify", "sortie/ini_br2-backend")
+    ).returncode == 0
+    assert (
+        _git(ws2 / "repos" / "web", "rev-parse", "--verify", "sortie/ini_br2-web")
+    ).returncode == 0
+
+
+def _ctx(ini: str, workspace: Path, repos: list[RepoConfig], tmp_path: Path) -> StageContext:
+    return StageContext(
+        initiative_id=ini,
+        thread_id="thr_x",
+        stage="eng_implement",
+        role=RoleId.ENG,
+        brief="b",
+        artifact_dir=str(tmp_path / "artifacts"),
+        workspace_dir=str(workspace),
+        repos=repos,
+    )
+
+
+@pytest.mark.anyio
+async def test_maybe_publish_on_stage_success(tmp_path: Path, monkeypatch, origin_repo: Path):
+    monkeypatch.setattr(settings, "git_push_mode", "on_stage_success")
+    monkeypatch.setattr(settings, "git_cleanup_after_push", True)
+    ini = "ini_hook1"
+    workspace = ensure_worktree(tmp_path, ini, tmp_path)
+    repos = [RepoConfig(url=str(origin_repo), branch="main", name="repo")]
+    await clone_repos(repos, workspace, ini)
+    clone = workspace / "repos" / "repo"
+    (clone / "impl.py").write_text("x=1\n", encoding="utf-8")
+
+    ctx = _ctx(ini, workspace, repos, tmp_path)
+    result = StageResult(status="ok", message="done")
+    meta = await _maybe_publish({"initiative_id": ini}, ctx, result, "eng_implement")
+    assert meta is not None and meta["git_publish_pushed"] == 1
+    assert meta["git_publish"][0]["branch"] == f"sortie/{ini}-repo"
+    # push 后副本清理
+    assert not (workspace / "repos").exists()
+
+
+@pytest.mark.anyio
+async def test_maybe_publish_gates(tmp_path: Path, monkeypatch, origin_repo: Path):
+    monkeypatch.setattr(settings, "git_push_mode", "on_approval")
+    ini = "ini_hook2"
+    workspace = ensure_worktree(tmp_path, ini, tmp_path)
+    repos = [RepoConfig(url=str(origin_repo), branch="main", name="repo")]
+    await clone_repos(repos, workspace, ini)
+    ctx = _ctx(ini, workspace, repos, tmp_path)
+    result = StageResult(status="ok")
+
+    # on_approval 模式下无 publish_pending 标记 → 不回写
+    assert await _maybe_publish({}, ctx, result, "eng_implement") is None
+    # 带 publish_pending → 回写
+    meta = await _maybe_publish(
+        {"initiative_id": ini, "publish_pending": True}, ctx, result, "eng_implement"
+    )
+    assert meta is not None
+    # off 模式 → 永不回写
+    monkeypatch.setattr(settings, "git_push_mode", "off")
+    assert await _maybe_publish({"publish_pending": True}, ctx, result, "eng_implement") is None
+    # 失败阶段 → 不回写
+    monkeypatch.setattr(settings, "git_push_mode", "on_stage_success")
+    assert await _maybe_publish({}, ctx, StageResult(status="fail"), "eng_implement") is None
+
+
+@pytest.mark.anyio
+async def test_disk_guard_skips_clone(tmp_path: Path, monkeypatch, origin_repo: Path):
+    monkeypatch.setattr(settings, "min_disk_free_mb", 1 << 40)  # 巨大阈值 → 必触发
+    ini = "ini_disk"
+    workspace = ensure_worktree(tmp_path, ini, tmp_path)
+    repos = [RepoConfig(url=str(origin_repo), branch="main", name="repo")]
+    section, log = await clone_repos(repos, workspace, ini)
+    assert any("DISK GUARD" in line for line in log)
+    assert not (workspace / "repos" / "repo").exists()
+    assert "NOT AVAILABLE" in section

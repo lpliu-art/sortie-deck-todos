@@ -1,0 +1,598 @@
+import { useEffect, useMemo, useRef, useState, type DragEvent } from "react";
+import {
+  listPipelineTiers,
+  updateBriefingPrefs,
+  updateInitiativeMaterials,
+  uploadMissionInput,
+} from "../api";
+import { playSfx } from "../sfx";
+import type { I18nKey } from "../i18n";
+import type {
+  ExternalMaterial,
+  Lang,
+  PipelineTier,
+  TaskKind,
+  TierGroup,
+} from "../types";
+import { MissionBriefingChat } from "./MissionBriefingChat";
+import type { ComposerAttachment } from "./ChatComposer";
+
+type Props = {
+  token: string;
+  lang: Lang;
+  tr: (key: I18nKey) => string;
+  busy: boolean;
+  setBusy: (v: boolean) => void;
+  onCancel: () => void;
+  onCreated: (id: string) => void;
+  onError: (msg: string) => void;
+};
+
+/** Local draft row — carries the decoded excerpt and the original File for upload. */
+type DraftMaterial = ExternalMaterial & {
+  uid: string;
+  /** 本地选中的原件；从会话恢复的行没有 File，只能保留摘录 */
+  file?: File;
+  /** 聊天附件只带 data URL，上传前用它还原成 File */
+  data_url?: string;
+};
+
+const KIND_ORDER = ["prd", "plan", "design", "data", "other"] as const;
+type MaterialKind = (typeof KIND_ORDER)[number];
+
+const KIND_LABEL: Record<MaterialKind, { zh: string; en: string }> = {
+  prd: { zh: "PRD", en: "PRD" },
+  plan: { zh: "计划", en: "Plan" },
+  design: { zh: "设计稿", en: "Design" },
+  data: { zh: "数据", en: "Data" },
+  other: { zh: "其他", en: "Other" },
+};
+
+const DEFAULT_ACCEPT =
+  "image/*,.md,.txt,.json,.csv,.yaml,.yml,.log,.pdf,.doc,.docx,.fig,text/plain,text/markdown,application/json";
+const TEXT_MIME = /^(text\/|application\/(json|yaml|x-yaml|xml))/i;
+const TEXT_EXT = /\.(md|txt|json|csv|ya?ml|log|xml)$/i;
+const MAX_FILES = 12;
+const MAX_BYTES = 8 * 1024 * 1024;
+
+function isTextLike(file: File): boolean {
+  return TEXT_MIME.test(file.type) || TEXT_EXT.test(file.name);
+}
+
+function readAsText(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(reader.error || new Error("read failed"));
+    reader.readAsText(file);
+  });
+}
+
+/** Mirrors `sortie_deck.materials.estimate_tokens` (CJK ≈ 1, latin ≈ ¼). */
+export function estimateTokens(text: string | undefined): number {
+  if (!text) return 0;
+  let cjk = 0;
+  for (const ch of text) {
+    const code = ch.codePointAt(0) || 0;
+    if (code >= 0x4e00 && code <= 0x9fff) cjk += 1;
+  }
+  const other = text.length - cjk;
+  return cjk + Math.max(0, other) / 4;
+}
+
+function detectKind(name: string): MaterialKind {
+  const n = name.toLowerCase();
+  if (/(^|[^a-z])(prd|需求|requirement)/.test(n)) return "prd";
+  if (/(计划|方案|plan|roadmap|design[_-]?doc|tech[_-]?design)/.test(n)) return "plan";
+  if (/\.(fig|sketch|psd|ai|xd)$/.test(n) || /(设计稿|design|mockup|ui)/.test(n)) return "design";
+  if (/\.(csv|xlsx?|json|log|tsv)$/.test(n) || /(数据|dataset|report|指标)/.test(n)) return "data";
+  return "other";
+}
+
+function formatSize(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function uid(): string {
+  return `mat_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+let seq = 0;
+
+function defaultPinned(kind: MaterialKind): boolean {
+  // Text docs default to pinned; binaries (design mockups) default to archived.
+  return kind === "prd" || kind === "plan" || kind === "data";
+}
+
+async function toDraft(file: File): Promise<DraftMaterial> {
+  const kind = detectKind(file.name);
+  let textExcerpt = "";
+  if (isTextLike(file)) {
+    try {
+      textExcerpt = (await readAsText(file)).slice(0, 24_000);
+    } catch {
+      textExcerpt = "";
+    }
+  }
+  seq += 1;
+  return {
+    uid: `${Date.now()}-${seq}`,
+    id: uid(),
+    name: file.name || (kind === "design" ? "design.png" : "file"),
+    kind,
+    mime: file.type || "application/octet-stream",
+    size: file.size,
+    pinned: defaultPinned(kind),
+    file,
+    text_excerpt: textExcerpt,
+  };
+}
+
+/** data URL → File：聊天附件（图片）没有 File 句柄，上传前在这里还原。 */
+async function dataUrlToFile(
+  dataUrl: string,
+  name: string,
+  mime: string,
+): Promise<File | undefined> {
+  try {
+    const res = await fetch(dataUrl);
+    const blob = await res.blob();
+    return new File([blob], name || "file", { type: mime || blob.type });
+  } catch {
+    return undefined;
+  }
+}
+
+/** Chat-composer attachments land in the external-materials panel (single intake). */
+function fromAttachment(a: ComposerAttachment): DraftMaterial | null {
+  if ((a.size || 0) > MAX_BYTES) return null;
+  const kind: MaterialKind = a.kind === "image" ? "design" : detectKind(a.name);
+  seq += 1;
+  return {
+    uid: `${Date.now()}-${seq}`,
+    id: uid(),
+    name: a.name || "file",
+    kind,
+    mime: a.mime || "application/octet-stream",
+    size: a.size || 0,
+    pinned: defaultPinned(kind),
+    data_url: a.dataUrl,
+    text_excerpt: a.textExcerpt || "",
+  };
+}
+
+export function NewTaskPage({ token, lang, tr, busy, setBusy, onCancel, onCreated, onError }: Props) {
+  const [materials, setMaterials] = useState<DraftMaterial[]>([]);
+  const [dragging, setDragging] = useState(false);
+  const fileRef = useRef<HTMLInputElement>(null);
+  // 规划会话一开启就会预生成任务 id，拿到 id 后立刻把原件传进任务目录
+  const [missionId, setMissionId] = useState("");
+  const uploadedRef = useRef<Set<string>>(new Set());
+  // 执行档位：auto 交给后端按简报推荐；显式选择则写进 briefing session，
+  // 确认建队时作为阶段预算（planner 只能在预算内减，不能加）
+  const [taskKind, setTaskKind] = useState<TaskKind>("auto");
+  const [tier, setTier] = useState<PipelineTier>("auto");
+  const [tierGroups, setTierGroups] = useState<TierGroup[]>([]);
+
+  async function uploadDraft(id: string, m: DraftMaterial) {
+    if (!m.file || uploadedRef.current.has(m.uid)) return;
+    uploadedRef.current.add(m.uid);
+    try {
+      const saved = await uploadMissionInput(token, id, m.file, {
+        kind: m.kind,
+        pinned: m.pinned,
+      });
+      setMaterials((prev) =>
+        prev.map((x) => (x.uid === m.uid ? { ...x, ...saved, uid: x.uid } : x)),
+      );
+    } catch (err) {
+      // 上传失败退回「仅摘录」：规划讨论仍可继续，但不能假装原件已落盘
+      uploadedRef.current.delete(m.uid);
+      onError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  // 档位数据：后端返回两套（开发/办公）各三档，前端不硬编码阶段清单
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const data = await listPipelineTiers(token);
+        if (!cancelled) setTierGroups(data.task_kinds || []);
+      } catch {
+        // 档位是增强项：加载失败退回 auto，不影响建队
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [token]);
+
+  // 会话就绪 / 档位变化时同步到后端；保存失败不阻断建队（后端按 auto 处理）
+  useEffect(() => {
+    if (!missionId) return;
+    void updateBriefingPrefs(token, missionId, { task_kind: taskKind, tier }).catch(
+      () => undefined,
+    );
+  }, [missionId, taskKind, tier, token]);
+
+  // 会话 id 到位后补传「先选文件、后建会话」的那批；上传成功会写回 stored_path
+  useEffect(() => {
+    if (!missionId) return;
+    for (const m of materials) void uploadDraft(missionId, m);
+  }, [missionId, materials]);
+
+  const pinned = useMemo(() => materials.filter((m) => m.pinned), [materials]);
+  const pinnedTokens = useMemo(
+    () => Math.round(pinned.reduce((sum, m) => sum + estimateTokens(m.text_excerpt), 0)),
+    [pinned],
+  );
+
+  async function addFiles(list: FileList | null) {
+    if (!list || !list.length) return;
+    const room = MAX_FILES - materials.length;
+    if (room <= 0) {
+      onError(lang === "zh" ? `最多 ${MAX_FILES} 份资料` : `Up to ${MAX_FILES} materials`);
+      return;
+    }
+    const picked = Array.from(list).slice(0, room);
+    const drafts: DraftMaterial[] = [];
+    for (const file of picked) {
+      if (file.size > MAX_BYTES) {
+        onError(
+          lang === "zh"
+            ? `${file.name} 超过 ${formatSize(MAX_BYTES)}，已跳过`
+            : `${file.name} exceeds ${formatSize(MAX_BYTES)}, skipped`,
+        );
+        continue;
+      }
+      drafts.push(await toDraft(file));
+    }
+    if (drafts.length) {
+      playSfx("toggle");
+      setMaterials((prev) => [...prev, ...drafts]);
+    }
+  }
+
+  function addAttachments(atts: ComposerAttachment[]) {
+    const room = MAX_FILES - materials.length;
+    if (room <= 0) {
+      onError(lang === "zh" ? `最多 ${MAX_FILES} 份资料` : `Up to ${MAX_FILES} materials`);
+      return;
+    }
+    const drafts: DraftMaterial[] = [];
+    for (const att of atts.slice(0, room)) {
+      const draft = fromAttachment(att);
+      if (!draft) {
+        onError(
+          lang === "zh"
+            ? `${att.name} 超过 ${formatSize(MAX_BYTES)}，已跳过`
+            : `${att.name} exceeds ${formatSize(MAX_BYTES)}, skipped`,
+        );
+        continue;
+      }
+      drafts.push(draft);
+    }
+    if (drafts.length) {
+      playSfx("toggle");
+      setMaterials((prev) => [...prev, ...drafts]);
+      // 聊天附件只有 data URL：还原成 File 后同样落任务目录（否则图片等于没给）
+      for (const d of drafts) {
+        if (!d.data_url) continue;
+        const dataUrl = d.data_url;
+        void (async () => {
+          const file = await dataUrlToFile(dataUrl, d.name, d.mime || "");
+          if (!file) return;
+          setMaterials((prev) => prev.map((x) => (x.uid === d.uid ? { ...x, file } : x)));
+        })();
+      }
+    }
+  }
+
+  function cycleKind(uidKey: string) {
+    setMaterials((prev) =>
+      prev.map((m) =>
+        m.uid === uidKey
+          ? { ...m, kind: KIND_ORDER[(KIND_ORDER.indexOf(m.kind as MaterialKind) + 1) % KIND_ORDER.length] }
+          : m,
+      ),
+    );
+  }
+
+  function togglePin(uidKey: string) {
+    playSfx("toggle");
+    setMaterials((prev) => prev.map((m) => (m.uid === uidKey ? { ...m, pinned: !m.pinned } : m)));
+  }
+
+  function removeAt(uidKey: string) {
+    setMaterials((prev) => prev.filter((m) => m.uid !== uidKey));
+  }
+
+  const materialsPayload = useMemo(
+    () => materials.map(({ uid: _uid, ...rest }) => rest),
+    [materials],
+  );
+
+  /** Attach imported materials to a planner-created mission, then navigate. */
+  async function handlePlannerCreated(id: string) {
+    if (materialsPayload.length) {
+      try {
+        await updateInitiativeMaterials(token, id, materialsPayload);
+      } catch (err) {
+        onError(err instanceof Error ? err.message : String(err));
+      }
+    }
+    onCreated(id);
+  }
+
+  function onDrop(e: DragEvent) {
+    e.preventDefault();
+    setDragging(false);
+    void addFiles(e.dataTransfer?.files || null);
+  }
+
+  const zh = lang === "zh";
+
+  const taskKindOptions = useMemo(
+    () => [
+      { value: "auto" as TaskKind, label: zh ? "自动" : "Auto" },
+      { value: "delivery" as TaskKind, label: zh ? "开发交付" : "Delivery" },
+      { value: "knowledge" as TaskKind, label: zh ? "办公/研究" : "Knowledge" },
+    ],
+    [zh],
+  );
+
+  const tierOptions = useMemo(
+    () => [
+      { value: "auto" as PipelineTier, label: zh ? "自动" : "Auto" },
+      { value: "express" as PipelineTier, label: zh ? "极速" : "Express" },
+      { value: "standard" as PipelineTier, label: zh ? "标准" : "Standard" },
+      { value: "full" as PipelineTier, label: zh ? "完整" : "Full" },
+    ],
+    [zh],
+  );
+
+  const activeGroup = useMemo(
+    () => tierGroups.find((g) => g.task_kind === taskKind) ?? null,
+    [tierGroups, taskKind],
+  );
+  const activeTier = useMemo(
+    () => activeGroup?.tiers.find((t) => t.tier === tier) ?? null,
+    [activeGroup, tier],
+  );
+
+  const plannerLabels = useMemo(
+    () => ({
+      title: zh ? "建队规划官" : "Squad planner",
+      placeholder: zh ? "描述任务目标…" : "Describe the mission…",
+      hint: zh
+        ? "多轮对话 · 附件请从右侧外部资料导入 · /confirm 确认"
+        : "Multimodal chat · attach via external materials · /confirm",
+      send: tr("send"),
+      confirm: zh ? "确认组建" : "Confirm",
+      reject: zh ? "驳回重来" : "Reject",
+      restart: zh ? "新会话" : "New chat",
+      waterfall: zh ? "规划瀑布流" : "Planning waterfall",
+    }),
+    [lang, tr],
+  );
+
+  return (
+    <main className="main page-pad intake-page">
+      <div className="intake-page-inner">
+        <div className="eyebrow">MISSION INTAKE</div>
+        <h2 className="page-title">{tr("newTask")}</h2>
+        <p className="hero-copy">
+          {zh
+            ? "与建队规划官多轮对话组建小队；导入的外部资料全部参与规划讨论，被钉住的将在任务创建后持续注入每轮对话的上下文。"
+            : "Chat with the squad planner to form the squad; all imported materials join the planning discussion, and pinned ones keep feeding every squad turn after creation."}
+        </p>
+
+        <section className="panel tier-panel">
+          <div className="panel-label">
+            {zh ? "执行档位" : "Execution tier"}
+            <span className="aux">PIPELINE TIER</span>
+          </div>
+          <div className="tier-row">
+            <span className="tier-row-label">{zh ? "任务类型" : "Task type"}</span>
+            <div className="tier-chips">
+              {taskKindOptions.map((opt) => (
+                <button
+                  key={opt.value}
+                  type="button"
+                  className={`tier-chip${taskKind === opt.value ? " on" : ""}`}
+                  onClick={() => {
+                    playSfx("toggle");
+                    setTaskKind(opt.value);
+                  }}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="tier-row">
+            <span className="tier-row-label">{zh ? "档位" : "Tier"}</span>
+            <div className="tier-chips">
+              {tierOptions.map((opt) => (
+                <button
+                  key={opt.value}
+                  type="button"
+                  className={`tier-chip${tier === opt.value ? " on" : ""}`}
+                  onClick={() => {
+                    playSfx("toggle");
+                    setTier(opt.value);
+                  }}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="tier-chain">
+            {activeTier ? (
+              <>
+                <span className="tier-chain-meta">
+                  {activeTier.stage_count} {zh ? "个阶段" : "stages"} ·{" "}
+                  {activeTier.eta_minutes[0]}-{activeTier.eta_minutes[1]} min
+                </span>
+                <span className="tier-chain-path">
+                  {activeTier.stages
+                    .map((s) => (zh ? s.label : s.label_en || s.label))
+                    .join(" → ")}
+                </span>
+                <span className="tier-chain-desc">{activeTier.description}</span>
+              </>
+            ) : (
+              <span className="tier-chain-desc">
+                {zh
+                  ? "按简报自动判定任务类型与档位；选定具体类型和档位后可预览阶段链路。"
+                  : "Task type and tier are inferred from the brief; pick both to preview the stage chain."}
+              </span>
+            )}
+          </div>
+        </section>
+
+        <div className="intake-grid">
+          <div className="intake-col intake-chat-col">
+            <section className="panel intake-chat-panel">
+              <MissionBriefingChat
+                token={token}
+                lang={lang}
+                busy={busy}
+                setBusy={setBusy}
+                onError={onError}
+                onCreated={handlePlannerCreated}
+                labels={plannerLabels}
+                materials={materialsPayload}
+                onImportFiles={addAttachments}
+                onSessionReady={setMissionId}
+                onMaterialsLoaded={(mats) =>
+                  setMaterials(mats.map((m) => ({ ...m, uid: `rst_${m.id}` })))
+                }
+                onReset={() => setMaterials([])}
+              />
+            </section>
+          </div>
+
+          <div className="intake-col">
+            <section className="panel">
+              <div className="panel-label">
+                {tr("intakeMaterials")}
+                <span className="aux">
+                  {materials.length} {zh ? "份" : "files"} · {tr("intakeKindHint")}
+                </span>
+              </div>
+              <div
+                className={`dropzone${dragging ? " hot" : ""}`}
+                onClick={() => fileRef.current?.click()}
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  setDragging(true);
+                }}
+                onDragLeave={() => setDragging(false)}
+                onDrop={onDrop}
+              >
+                <div className="dz-main">{tr("intakeDrop")}</div>
+                <div className="dz-hint">
+                  {zh ? "支持 PRD · 计划文档 · 设计稿 · 数据 等多格式，可批量" : "PRD · plan · design · data — multi-select"}
+                </div>
+                <input
+                  ref={fileRef}
+                  type="file"
+                  multiple
+                  accept={DEFAULT_ACCEPT}
+                  style={{ display: "none" }}
+                  onChange={(e) => {
+                    void addFiles(e.target.files);
+                    e.target.value = "";
+                  }}
+                />
+              </div>
+
+              <div className="file-list">
+                {materials.map((m) => (
+                  <div key={m.uid} className={`file-card${m.pinned ? " pinned" : ""}`}>
+                    <button
+                      type="button"
+                      className={`type-chip t-${m.kind}`}
+                      title={tr("intakeKindHint")}
+                      onClick={() => cycleKind(m.uid)}
+                    >
+                      {KIND_LABEL[(m.kind as MaterialKind) in KIND_LABEL ? (m.kind as MaterialKind) : "other"][lang]}
+                    </button>
+                    <div className="file-info">
+                      <div className="file-name" title={m.name}>
+                        {m.name}
+                      </div>
+                      <div className="file-meta">
+                        {formatSize(m.size || 0)}
+                        <span className="dot">·</span>
+                        {m.text_excerpt
+                          ? `≈${Math.round(estimateTokens(m.text_excerpt))} tok`
+                          : zh
+                            ? "非文本 · 供检索"
+                            : "non-text"}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      className={`ctx-toggle${m.pinned ? " on" : ""}`}
+                      onClick={() => togglePin(m.uid)}
+                    >
+                      <span className="tgl-label">{m.pinned ? tr("intakePinned") : tr("intakeArchived")}</span>
+                      <span className="switch" />
+                    </button>
+                    <button type="button" className="file-remove" title={tr("delete")} onClick={() => removeAt(m.uid)}>
+                      ×
+                    </button>
+                  </div>
+                ))}
+                {!materials.length && (
+                  <div className="empty-files">
+                    {zh ? "── 尚未导入资料 · 支持一次多选 ──" : "── no materials yet ──"}
+                  </div>
+                )}
+              </div>
+            </section>
+
+            <section className="panel">
+              <div className="panel-label">
+                {tr("intakeCtxPreview")}
+                <span className="aux">CTX PREVIEW</span>
+              </div>
+              <div className="ctx-list">
+                {pinned.map((m) => (
+                  <div key={m.uid} className="ctx-item">
+                    <span className="pin">◉</span>
+                    <span className="ctx-name" title={m.name}>
+                      {m.name}
+                    </span>
+                    <span className="ctx-tok">
+                      {m.text_excerpt ? `≈${Math.round(estimateTokens(m.text_excerpt))} tok` : tr("intakeRetrieval")}
+                    </span>
+                  </div>
+                ))}
+                {!pinned.length && <div className="empty-files">{tr("intakeNoPinned")}</div>}
+              </div>
+              <div className="ctx-total">
+                <span>{tr("intakeEstimate")}</span>
+                <b>{pinnedTokens ? `≈ ${pinnedTokens.toLocaleString()} tokens` : "0 tokens"}</b>
+              </div>
+              <p className="ctx-note">{tr("intakeCtxNote")}</p>
+            </section>
+
+            <div className="actions">
+              <button type="button" className="btn" onClick={onCancel}>
+                {tr("cancel")}
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </main>
+  );
+}

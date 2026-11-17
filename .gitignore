@@ -1,0 +1,34 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+data/
+*.db
+.env
+# 云端专用配置（含真实密钥，勿提交）
+.env.cloud
+.DS_Store
+node_modules/
+apps/web/dist/
+apps/web/.vite/
+# TypeScript 增量构建产物
+*.tsbuildinfo
+.coverage
+htmlcov/
+site/
+tmp/
+
+# CodeBuddy local project data
+.codebuddy/
+
+# Playwright CLI local session artifacts
+.playwright-cli/
+
+# JetBrains IDE project files
+.idea/

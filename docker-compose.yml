@@ -1,0 +1,87 @@
+# 单机部署：api（含 /mcp）+ N 个 worker，共享一个数据卷。
+#
+#   cp .env.docker.example .env      # 填 TDT_TOKEN_SECRET 与 TDT_PUBLIC_BASE_URL
+#   docker compose build
+#   docker compose up -d
+#   WORKER_REPLICAS=3 docker compose up -d --scale worker=3   # 扩容
+#
+# 注意：api 与 worker 必须用同一个数据卷；跨机器共享需要外部数据库。
+
+x-common-env: &common-env
+  TDT_DATA_DIR: /data
+  TDT_STORAGE: sqlite
+  TDT_RUN_BACKEND: sqlite
+  TDT_WEB_DIST: /app/apps/web/dist
+
+services:
+  api:
+    # 必须是显式 target：Dockerfile 最后一个 stage 是 runtime-harness，
+    # 不写 target 会构建出它；但写 runtime（精简）会导致 /api/harnesses 探针
+    # 在本进程里跑、看不到 Claude Code / Codex 二进制，页面把所有 harness
+    # 标成"不可用"（任务执行侧 worker 其实是可用的）。
+    # 因此 api 与 worker 统一使用 runtime-harness，两个服务共用一个镜像。
+    build:
+      context: .
+      target: runtime-harness
+    image: sortie-deck:local
+    init: true
+    env_file:
+      # 本地默认 .env（模型走内网 newapi）；云端用 SORTIE_ENV_FILE=.env.cloud
+      - ${SORTIE_ENV_FILE:-.env}
+    environment:
+      <<: *common-env
+      TDT_HOST: 0.0.0.0
+      TDT_PORT: "8787"
+      # API 副本不消费队列，执行交给 worker，避免抢同一个 job
+      TDT_RUN_WORKER: "false"
+    ports:
+      - "${SORTIE_PORT:-8787}:8787"
+    volumes:
+      - sortie-data:/data
+    restart: unless-stopped
+
+  worker:
+    # 与 api 复用同一镜像，只是启动命令不同（worker 消费队列）
+    image: sortie-deck:local
+    build:
+      context: .
+      target: runtime-harness
+    init: true
+    command: ["worker"]
+    # Claude Code Bash 沙箱（bubblewrap）的容器级前提，2026-11-10 实测：
+    # 宿主需 kernel.apparmor_restrict_unprivileged_userns=0（见部署说明），
+    # 容器内再放开 seccomp 与 AppArmor 两项即可，无需 SYS_ADMIN。
+    # 只给 worker：api 不执行 agent，不扩大其权限面。
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+    env_file:
+      - ${SORTIE_ENV_FILE:-.env}
+    environment:
+      <<: *common-env
+      TDT_RUN_WORKER: "true"
+    volumes:
+      - sortie-data:/data
+    deploy:
+      replicas: ${WORKER_REPLICAS:-2}
+    restart: unless-stopped
+
+  # 需要 HTTPS 时启用：docker compose --profile tls up -d
+  caddy:
+    image: caddy:2
+    profiles: ["tls"]
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      SORTIE_DOMAIN: ${SORTIE_DOMAIN:-localhost}
+    volumes:
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    restart: unless-stopped
+
+volumes:
+  sortie-data:
+  caddy-data:
+  caddy-config:

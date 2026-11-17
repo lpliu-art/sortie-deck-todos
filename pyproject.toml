@@ -1,0 +1,123 @@
+[project]
+name = "sortie-deck"
+version = "0.1.0"
+description = "Sortie Deck — AI-native office iteration control plane with pluggable stage executors"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+  { name = "Sortie Deck contributors" },
+]
+keywords = [
+  "ai-agents",
+  "langgraph",
+  "orchestration",
+  "hitl",
+  "devops",
+  "sortie-deck",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Framework :: FastAPI",
+  "Topic :: Software Development :: Build Tools",
+]
+dependencies = [
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.32.0",
+  "langgraph>=0.2.0",
+  "langgraph-checkpoint-sqlite>=2.0.0",
+  "langchain-core>=0.3.0",
+  # LLM 接入层走 LangChain ChatModel 抽象（见 llm_chain.py）
+  "langchain-openai>=1.0.0",
+  "pydantic>=2.9.0",
+  "pydantic-settings>=2.6.0",
+  "pyyaml>=6.0.2",
+  "httpx>=0.27.0",
+  "aiosqlite>=0.20.0",
+  "python-multipart>=0.0.12",
+  "sse-starlette>=2.1.0",
+  # 远程 MCP 服务端（Streamable HTTP）。之前只是 claude-agent-sdk 的传递依赖，
+  # 正式能力必须直接声明并锁定，否则上游一变就消失。
+  "mcp>=2.3.0,<3",
+  "pypdf>=5.0.0",
+  "python-docx>=1.1.0",
+  "python-pptx>=1.0.0",
+  "openpyxl>=3.1.0",
+  # 全链路追踪：只装 API（纯接口，无传递依赖）。SDK/exporter 在 [otel] extra，
+  # 未安装时 observability 模块自动退化为 no-op（见 sortie_deck/observability.py）。
+  "opentelemetry-api>=1.29.0",
+  # 凭据加密（git 凭据与 IM 接入共用同一套主密钥）。此前仅靠传递依赖，
+  # 干净环境里 git_cred / im.connection 会 ImportError，必须显式声明。
+  "cryptography>=43.0.0",
+  # 微信扫码登录的二维码渲染（纯 Python、无传递依赖）。
+  # 微信返回的是网页链接而不是图片，必须本地生成二维码。
+  "segno>=1.6.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/lpliu-art/sortie-deck-todos"
+Documentation = "https://github.com/lpliu-art/sortie-deck-todos/blob/dev/DESIGN.md"
+Repository = "https://github.com/lpliu-art/sortie-deck-todos"
+Issues = "https://github.com/lpliu-art/sortie-deck-todos/issues"
+Changelog = "https://github.com/lpliu-art/sortie-deck-todos/blob/dev/CHANGELOG.md"
+
+[project.optional-dependencies]
+postgres = ["langgraph-checkpoint-postgres>=2.0.0", "psycopg[binary]>=3.2.0"]
+s3 = ["boto3>=1.35.0"]
+# 全链路追踪的运行时（SDK + OTLP/HTTP exporter）。不装则 observability 为 no-op。
+otel = [
+  "opentelemetry-sdk>=1.29.0",
+  "opentelemetry-exporter-otlp-proto-http>=1.29.0",
+]
+dev = ["pytest>=8.3.0", "pytest-asyncio>=0.24.0", "ruff>=0.7.0"]
+# Agent harness providers (cloud runtime = the env this app runs in)
+harness-claude = ["claude-agent-sdk>=0.1.0"]
+# DeepSeek Harness：精确 pin 到 rc（官方声明会有 breaking change），运行时二进制
+# 由 deepseek-harness-runtime-bin 同版本随包附带（约 95MB/平台，不需要系统 Node）。
+harness-dsh = ["deepseek-harness-sdk==0.2.1rc2"]
+# IM 长连接 SDK。不装也能用 URL 回调模式；装了才支持「WebSocket 长连接」。
+im = ["lark-oapi>=1.4.0", "dingtalk-stream>=0.20.0"]
+docs = [
+  "mkdocs-material>=9.5.0",
+  "mkdocs-static-i18n>=1.2.0",
+]
+
+[project.scripts]
+sortie = "sortie_deck.cli:main"
+sortie-api = "sortie_deck.api.app:run"
+# Legacy aliases
+tdt = "sortie_deck.cli:main"
+tdt-api = "sortie_deck.api.app:run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sortie_deck"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+src = ["src", "tests"]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = [
+  "B008",   # FastAPI Depends()/Header() in defaults
+  "E501",   # line length handled by formatter preference
+  "UP042",  # str Enum remains intentional for JSON/API
+]
+
+[tool.ruff.lint.per-file-ignores]
+"src/sortie_deck/orchestrator.py" = ["BLE001", "S110", "SIM105"]
+"src/sortie_deck/cli.py" = ["BLE001"]

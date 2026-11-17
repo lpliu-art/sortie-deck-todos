@@ -1,0 +1,4281 @@
+from __future__ import annotations
+
+import asyncio
+import io
+import json
+import logging
+import tempfile
+from contextlib import asynccontextmanager, suppress
+from pathlib import Path
+from typing import Any, Literal
+
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+)
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+from sse_starlette.sse import EventSourceResponse
+
+from sortie_deck import mission_input
+from sortie_deck.agent_forge import ForgeRequest, get_agent_forge
+from sortie_deck.agents import (
+    AgentCatalog,
+    CreateAgentRequest,
+    UpdateAgentRequest,
+)
+from sortie_deck.api_keys import ALLOWED_TTL_MONTHS, DEFAULT_TTL_MONTHS
+from sortie_deck.auth import (
+    AuthStore,
+    CreateUserRequest,
+    LoginRequest,
+    PublicUser,
+    RegisterRequest,
+)
+from sortie_deck.doc_extract import extract_office_text
+from sortie_deck.knowledge import (
+    CreateKnowledgeBaseRequest,
+    CreateKnowledgeRequest,
+    KnowledgeBaseModel,
+    KnowledgeBaseStore,
+    KnowledgeStore,
+    UpdateKnowledgeBaseRequest,
+    UpdateKnowledgeRequest,
+)
+from sortie_deck.knowledge_gateway import (
+    ImportKnowledgeRequest,
+    KnowledgeGateway,
+    gateway_from_settings,
+)
+from sortie_deck.memory import (
+    CreateMemoryRequest,
+    MemoryStore,
+    UpdateMemoryRequest,
+)
+from sortie_deck.models import (
+    ConfirmPipelineRequest,
+    CreateInitiativeRequest,
+    DiscussParticipateRequest,
+    ExternalMaterial,
+    ForgeReviewRequiredError,
+    HitlAction,
+    HitlDecision,
+    HitlSubmitRequest,
+    JoinRoomRequest,
+    MissionShare,
+    PipelineNotConfirmedError,
+    PostRoomMessageRequest,
+    RepoConfig,
+    UpdatePipelineRequest,
+)
+from sortie_deck.orchestrator import Orchestrator, bind_catalogs, get_orchestrator
+from sortie_deck.persona import parse_persona
+from sortie_deck.pipeline import catalog_by_id, list_tracks, stage_catalog
+from sortie_deck.prompt_enhance import EnhancePromptRequest
+from sortie_deck.roles import RoleSpec, get_role_registry, normalize_role_key
+from sortie_deck.settings import settings
+from sortie_deck.toolkit import (
+    CreateToolkitRequest,
+    ImportToolkitRequest,
+    ToolkitStore,
+    UpdateToolkitRequest,
+)
+from sortie_deck.weknora import WeKnoraError
+
+_auth: AuthStore | None = None
+logger = logging.getLogger(__name__)
+_knowledge: KnowledgeStore | None = None
+_knowledge_gw: KnowledgeGateway | None = None
+_kb_bases: KnowledgeBaseStore | None = None
+_memory: MemoryStore | None = None
+_agents: AgentCatalog | None = None
+_toolkit: ToolkitStore | None = None
+_briefing: Any = None
+
+
+def get_auth() -> AuthStore:
+    """复用 service 层的单例：两个 AuthStore 实例会各自 read-modify-write users.json。"""
+    from sortie_deck.service import get_auth_store
+
+    return get_auth_store()
+
+
+def _ensure_mission_delete(ini: Any, user: PublicUser) -> None:
+    """解散任务（删除）：仅创建者或 admin。
+
+    管理员对他人任务只读，但保留「解散」这一项管理能力。
+    无归属任务（created_by 为空）同样只允许 admin：历史数据应先用
+    scripts/backfill_mission_owner.py 回填创建者。
+    """
+    if user.role == "admin":
+        return
+    created_by = getattr(ini, "created_by", None)
+    if not created_by or created_by != user.id:
+        raise HTTPException(403, "仅任务创建者或 admin 可解散任务")
+
+
+def _ensure_mission_share_owner(ini: Any, user: PublicUser) -> None:
+    """共享管理（加人/移除他人）：仅创建者。
+
+    admin 不再是共享操作的旁路——管理员不能把他人任务共享给第三方，
+    需要共享时由创建者自己操作。被共享者退出共享另走 remove 自身分支。
+    """
+    created_by = getattr(ini, "created_by", None)
+    if not created_by or created_by != user.id:
+        raise HTTPException(403, "仅任务创建者可将任务共享给他人")
+
+
+def _is_mission_shared_with(ini: Any, user_id: str) -> bool:
+    """判断用户是否在任务的共享名单中。"""
+    return any(s.user_id == user_id for s in getattr(ini, "shared_with", []) or [])
+
+
+def _ensure_mission_control(ini: Any, user: PublicUser) -> None:
+    """任务运行控制：创建者或被显式共享的用户。
+
+    admin 对他人任务只读（可看列表/详情/实时过程，可解散），不能启动、停止、
+    确认门禁、改航线、换 harness 或在房间里发言。若 admin 本人是创建者，
+    或被 owner 显式共享，则同样拥有控制权。
+    """
+    created_by = getattr(ini, "created_by", None)
+    if created_by and created_by == user.id:
+        return
+    if _is_mission_shared_with(ini, user.id):
+        return
+    raise HTTPException(403, "仅任务创建者或被共享用户可控制任务运行；管理员为只读")
+
+
+def _ensure_mission_access(ini: Any, user: PublicUser) -> None:
+    """任务访问校验：创建者 / admin / 被共享用户可访问（删除另有 owner 校验）。
+
+    共享用户拥有除删除外的全部权限（查看详情/对话、启动/停止、HITL 等）。
+    无归属任务（created_by 为空）仅 admin 可访问：这类历史数据需先跑
+    scripts/backfill_mission_owner.py 回填创建者，或由 owner 显式共享。
+    """
+    if user.role == "admin":
+        return
+    # 显式共享优先：无归属的历史任务只要 owner 共享过，被共享者仍可访问
+    if _is_mission_shared_with(ini, user.id):
+        return
+    created_by = getattr(ini, "created_by", None)
+    if not created_by:
+        raise HTTPException(403, "该任务无归属信息，仅管理员可访问；请先回填创建者")
+    if created_by == user.id:
+        return
+    raise HTTPException(403, "无权访问该任务（未共享给当前账号）")
+
+
+def _visible_initiatives(items: list[Any], user: PublicUser) -> list[Any]:
+    """任务列表按账号过滤：创建者 / 被共享用户 / admin 可见。
+
+    无归属任务（created_by 为空）仅 admin 可见，不再全站放行；
+    其他账号要访问必须由 owner 通过 shared_with 显式共享。
+    """
+    if user.role == "admin":
+        return items
+    return [
+        i
+        for i in items
+        if getattr(i, "created_by", None) == user.id
+        or _is_mission_shared_with(i, user.id)
+    ]
+
+
+def _owned_mission_ids(user: PublicUser) -> set[str]:
+    """当前用户作为所有权人（created_by）的任务 id 集合。
+
+    小群属于执行过程的内部讨论，可见性比任务本身更窄：只认所有权，
+    不随 shared_with 传递，也不给 admin 角色豁免。想要"能不能看别人任务"
+    这种更宽的口径请用 `_ensure_mission_access`。
+    """
+    return {
+        i.id for i in orch().list_initiatives() if getattr(i, "created_by", None) == user.id
+    }
+
+
+def get_knowledge() -> KnowledgeStore:
+    global _knowledge
+    if _knowledge is None:
+        _knowledge = KnowledgeStore(settings.knowledge_db)
+    return _knowledge
+
+
+def get_knowledge_gateway() -> KnowledgeGateway:
+    global _knowledge_gw
+    if _knowledge_gw is None:
+        _knowledge_gw = gateway_from_settings(settings, get_knowledge())
+    return _knowledge_gw
+
+
+def get_knowledge_bases() -> KnowledgeBaseStore:
+    global _kb_bases
+    if _kb_bases is None:
+        _kb_bases = KnowledgeBaseStore(settings.knowledge_bases_db)
+    return _kb_bases
+
+
+def _visible_base_ids(user: PublicUser) -> set[str] | None:
+    """当前用户可见的知识库 id 集合；admin 返回 None 表示不过滤（全可见）。
+
+    可见性规则：global 全员；user 仅所有者本人；task 按任务可见性
+    （创建者 / 被共享用户，复用 _visible_initiatives 的口径）。
+    """
+    if user.role == "admin":
+        return None
+    visible_tasks = {i.id for i in _visible_initiatives(orch().list_initiatives(), user)}
+    out: set[str] = set()
+    for b in get_knowledge_bases().list():
+        if b.scope == "global" or (b.scope == "user" and b.scope_id == user.id):
+            out.add(b.id)
+        elif b.scope == "task" and b.scope_id in visible_tasks:
+            out.add(b.id)
+    return out
+
+
+def _ensure_base_write(user: PublicUser, base: KnowledgeBaseModel) -> None:
+    """知识库写权限（建库后续的编辑/导入/删除）：global 仅 admin；user 仅本人；task 校验任务访问。"""
+    if user.role == "admin":
+        return
+    if base.scope == "global":
+        raise HTTPException(403, "全局共享知识库仅管理员可操作")
+    if base.scope == "user" and base.scope_id != user.id:
+        raise HTTPException(403, "仅知识库所有者可操作")
+    if base.scope == "task":
+        # 任务知识库：能访问该任务（创建者/被共享）即可导入
+        ini = orch().get(base.scope_id)
+        if ini is not None:
+            _ensure_mission_access(ini, user)
+
+
+def get_memory() -> MemoryStore:
+    global _memory
+    if _memory is None:
+        # Pluggable shared-memory backend: local, or local + mem0 in parallel.
+        from sortie_deck.memory import build_memory_store
+
+        _memory = build_memory_store(settings.memory_db)  # type: ignore[assignment]
+    return _memory
+
+
+def get_agents() -> AgentCatalog:
+    global _agents
+    if _agents is None:
+        _agents = AgentCatalog(settings.agents_db)
+    return _agents
+
+
+def get_toolkit() -> ToolkitStore:
+    global _toolkit
+    if _toolkit is None:
+        _toolkit = ToolkitStore(settings.toolkit_db)
+    return _toolkit
+
+
+def get_briefing():
+    global _briefing
+    if _briefing is None:
+        from sortie_deck.mission_briefing import MissionBriefingAgent
+
+        o = get_orchestrator()
+
+        async def _save(ini):
+            o.store.upsert(ini)
+            return ini
+
+        _briefing = MissionBriefingAgent(
+            settings=settings,
+            agents=get_agents(),
+            knowledge=get_knowledge_gateway(),
+            forge=get_agent_forge(),
+            create_initiative=o.create_initiative,
+            list_initiatives=o.list_initiatives,
+            save_initiative=_save,
+        )
+    return _briefing
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    from sortie_deck import observability as obs
+    from sortie_deck.runtime import (
+        configure_logging,
+        ensure_runtime_dirs,
+        validate_settings,
+    )
+
+    configure_logging(settings.log_level)
+    # 全链路追踪：开关关闭 / 未装 SDK / endpoint 为空时自动降级为 no-op，
+    # 不阻断启动（见 sortie_deck/observability.py）
+    obs.init_tracing(settings)
+    ensure_runtime_dirs(settings)
+    # 旧布局（data/artifacts|worktrees|rooms）→ data/missions/<id>/ 启动迁移（幂等）
+    from sortie_deck.layout import migrate_legacy_layout
+
+    migrated = migrate_legacy_layout(settings.data_dir)
+    if migrated:
+        logger.info("mission layout 迁移完成: %s", migrated)
+    # 旧全局 briefings.json → 按约定不迁移、直接删除（会话改落 missions/<id>/chat/）
+    from sortie_deck.mission_briefing import drop_legacy_briefing_store
+
+    drop_legacy_briefing_store(settings.data_dir)
+    validate_settings(settings)
+    orch = get_orchestrator()
+    await orch.startup()
+    get_auth()
+    get_knowledge()
+    mem = get_memory()
+    agents = get_agents()
+    toolkit = get_toolkit()
+    bind_catalogs(agents=agents, memory=mem, toolkit=toolkit)
+    app.state.orch = orch
+    # IM 后台循环：进程重启后要恢复已配置的渠道，否则会出现
+    # 「显示已连接但收不到消息」——循环只在扫码成功时被 spawn 过。
+    im_stack = None
+    try:
+        from sortie_deck.im.service import get_stack
+
+        im_stack = get_stack()
+        if im_stack is not None and im_stack.manager.consumer:
+            await im_stack.runner.start()
+    except Exception as exc:  # noqa: BLE001 — IM 是增强能力，不能拖垮启动
+        logger.warning("IM 后台循环启动失败（API 其余功能正常）: %s", exc)
+    yield
+    if im_stack is not None:
+        with suppress(Exception):
+            await im_stack.runner.stop()
+    await orch.shutdown()
+    # flush 最后一批 span，否则进程退出时 BatchSpanProcessor 队列里的会丢
+    obs.shutdown_tracing()
+
+
+app = FastAPI(title="Sortie Deck", version="0.5.0", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origin_list,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def orch() -> Orchestrator:
+    return get_orchestrator()
+
+
+def _bearer(authorization: str | None) -> str | None:
+    if not authorization:
+        return None
+    if authorization.lower().startswith("bearer "):
+        return authorization[7:].strip()
+    return authorization.strip()
+
+
+def require_user(authorization: str | None = Header(default=None)) -> PublicUser:
+    """同时接受登录 token 与用户级 API Key。
+
+    两条凭据最终都解析成 ``PublicUser``，下游路由不需要知道调用方是浏览器
+    还是本地 Claude Code——这正是「MCP 建的任务归属到 Key 所属账号」的基础。
+    """
+    from sortie_deck.service import ServiceError, resolve_principal
+
+    try:
+        return resolve_principal(authorization, source="web").user
+    except ServiceError as exc:
+        raise HTTPException(exc.http_status, exc.message) from exc
+
+
+def require_admin(user: PublicUser = Depends(require_user)) -> PublicUser:
+    if user.role != "admin":
+        raise HTTPException(403, "admin only")
+    return user
+
+
+def _mission_access_guard(
+    initiative_id: str, user: PublicUser = Depends(require_user)
+) -> PublicUser:
+    """FastAPI 依赖：任务级访问校验（创建者/admin/被共享用户，删除另走 owner 校验）。"""
+    ini = orch().get(initiative_id)
+    if not ini:
+        raise HTTPException(404, "Initiative not found")
+    _ensure_mission_access(ini, user)
+    return user
+
+
+def _mission_control_guard(
+    initiative_id: str, user: PublicUser = Depends(require_user)
+) -> PublicUser:
+    """FastAPI 依赖：任务控制级校验（创建者或被共享用户；admin 只读）。"""
+    ini = orch().get(initiative_id)
+    if not ini:
+        raise HTTPException(404, "Initiative not found")
+    _ensure_mission_control(ini, user)
+    return user
+
+
+def _sandbox_health() -> dict[str, Any]:
+    """health 用的沙箱状态：配置文件是否存在、依赖二进制是否在 PATH。
+
+    只回答「镜像装没装齐、配置指没指对」，不探测 namespace 权限（那由容器
+    security_opt 决定，属于部署事实）。
+    """
+    from sortie_deck.permissions import sandbox_preflight
+
+    config_file = str(settings.harness_settings_file or "").strip()
+    missing = set(sandbox_preflight()["missing"])
+    return {
+        "config_file": config_file,
+        "config_present": bool(config_file) and Path(config_file).is_file(),
+        "bwrap": "bwrap" not in missing,
+        "socat": "socat" not in missing,
+    }
+
+
+@app.get("/api/health")
+async def health() -> dict[str, Any]:
+    o = orch()
+    return {
+        "status": "ok",
+        "product": "Sortie Deck",
+        "version": app.version,
+        "env": settings.env,
+        "storage": settings.storage,
+        "run_backend": settings.run_backend,
+        "artifact_backend": settings.artifact_backend,
+        # 运维可直接核对云端/本地是否配成同一个权限模式（漏配是本次故障的起点）
+        "permission_mode": settings.coding_permission_mode,
+        "sandbox": _sandbox_health(),
+        "initiatives": len(o.list_initiatives()),
+        "executors": len(o.registry.names()),
+    }
+
+
+@app.post("/api/auth/login")
+async def login(req: LoginRequest) -> dict[str, Any]:
+    try:
+        payload = get_auth().login(req.username, req.password)
+        return payload.model_dump()
+    except PermissionError as exc:
+        # 密码正确但账号待审核/已被拒绝时返回 403 与具体原因，其余为 401 凭据错误
+        msg = str(exc)
+        if msg == "account pending":
+            raise HTTPException(403, "account pending approval") from None
+        if msg == "account rejected":
+            raise HTTPException(403, "account rejected") from None
+        raise HTTPException(401, "invalid username or password") from None
+
+
+@app.post("/api/auth/register")
+async def register(req: RegisterRequest) -> dict[str, Any]:
+    """自助注册：创建待审核账号，管理员通过后才能登录；用户名重复返回 400。"""
+    if not req.username.strip() or not req.password:
+        raise HTTPException(400, "username and password required")
+    try:
+        user = get_auth().register(req)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"status": "pending", "user": user.model_dump()}
+
+
+@app.post("/api/auth/logout")
+async def logout(authorization: str | None = Header(default=None)) -> dict[str, str]:
+    token = _bearer(authorization)
+    if token:
+        get_auth().logout(token)
+    return {"status": "ok"}
+
+
+@app.delete("/api/auth/account")
+async def delete_own_account(user: PublicUser = Depends(require_user)) -> dict[str, str]:
+    """账号注销：用户永久删除自己的账号（清除登录 token）；名下任务与共享关系保留。"""
+    try:
+        get_auth().delete_self(user.id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except KeyError:
+        raise HTTPException(404, "user not found") from None
+    return {"status": "deleted"}
+
+
+@app.get("/api/auth/me")
+async def me(user: PublicUser = Depends(require_user)) -> dict[str, Any]:
+    return user.model_dump()
+
+
+@app.get("/api/export/user")
+async def export_user_data(user: PublicUser = Depends(require_user)) -> Response:
+    """导出当前登录用户自己的数据为单个 JSON 文件（设置区「导出数据」按钮调用）。
+
+    组装规则见 ``export_data.build_user_export``：只含本人数据，服务端组装时
+    即剔除 ``password_hash`` / API Key 明文 / 登录令牌。载荷超过 20 MB 时返回
+    413（PRD D-4），不静默截断。
+
+    输入输出示例：
+    - 请求：``GET /api/export/user`` + ``Authorization: Bearer <token>``
+    - 响应头：``Content-Disposition: attachment; filename="sortie-data-ada-20261102-101500.json"``
+    - 响应体：``{"meta": {...}, "profile": {...}, "api_keys": [...], ...}``
+    """
+    from sortie_deck.export_data import (
+        ExportTooLargeError,
+        build_user_export,
+        export_filename,
+        serialize_export_limited,
+    )
+    from sortie_deck.service import get_api_key_store
+
+    payload = build_user_export(
+        user,
+        auth_store=get_auth(),
+        api_key_store=get_api_key_store(),
+        initiatives=orch().list_initiatives(),
+        knowledge_base_store=get_knowledge_bases(),
+        knowledge_store=get_knowledge(),
+        memory_store=get_memory(),
+        room_store=orch().rooms,
+    )
+    # 按分区增量序列化，超限在分区边界提前中止，避免整串拷贝放大内存（FIND-02）
+    try:
+        body = serialize_export_limited(payload)
+    except ExportTooLargeError:
+        raise HTTPException(413, "导出数据过大，请减少数据后重试") from None
+    filename = export_filename(user)
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            # 导出含用户隐私数据，禁止浏览器/代理缓存
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# 用户级 API Key：远程 MCP / CLI 长期凭据
+# ---------------------------------------------------------------------------
+
+
+class CreateApiKeyBody(BaseModel):
+    name: str = ""
+    #: 有效期（月），只接受 1/3/6/12；默认 1 个月
+    expires_in_months: int = DEFAULT_TTL_MONTHS
+
+
+def _mcp_snippet(full_key: str) -> dict[str, Any]:
+    """生成主流 MCP 客户端的接入片段（Claude Code / Codex / Cursor / OpenCode）。
+
+    ``url`` 必须是用户笔记本能访问到的地址，所以走 ``resolved_public_base_url``；
+    监听 0.0.0.0 时直接抄 host 会给出一个连不上的地址。
+
+    片段格式在 2026-10 按各客户端官方文档核对：
+    - Claude Code: ``.mcp.json`` 里 ``type`` 必填，缺省会按 stdio 处理
+    - Codex: ``config.toml`` 的 ``[mcp_servers.*]``，远程用 ``url`` + ``http_headers``
+    - Cursor: ``mcp.json`` 里有 ``url`` 即判定远程，``type`` 可省
+    - OpenCode: ``opencode.json`` 里 ``type: "remote"`` + ``headers``
+    """
+    base = settings.resolved_public_base_url
+    url = f"{base}/mcp"
+    auth = f"Bearer {full_key}"
+
+    claude_json = {
+        "mcpServers": {
+            "sortie-deck": {
+                "type": "http",
+                "url": url,
+                "headers": {"Authorization": auth},
+            }
+        }
+    }
+    cursor_json = {
+        "mcpServers": {
+            "sortie-deck": {
+                "url": url,
+                "headers": {"Authorization": auth},
+            }
+        }
+    }
+    opencode_json = {
+        "$schema": "https://opencode.ai/config.json",
+        "mcp": {
+            "sortie-deck": {
+                "type": "remote",
+                "url": url,
+                "enabled": True,
+                "headers": {"Authorization": auth},
+            }
+        },
+    }
+    codex_toml = (
+        "[mcp_servers.sortie-deck]\n"
+        f'url = "{url}"\n'
+        f'http_headers = {{ Authorization = "{auth}" }}\n'
+    )
+    command = (
+        f"claude mcp add --transport http sortie-deck {url} "
+        f'--header "Authorization: Bearer {full_key}"'
+    )
+
+    def dump(payload: dict[str, Any]) -> str:
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    return {
+        "url": url,
+        # 旧字段保留一个版本，避免外部脚本直接失效；前端只读 clients
+        "json": claude_json,
+        "command": command,
+        "clients": [
+            {
+                "id": "claude-code",
+                "label": "Claude Code",
+                "target": ".mcp.json",
+                "language": "json",
+                "code": dump(claude_json),
+                "command": command,
+            },
+            {
+                "id": "codex",
+                "label": "Codex CLI",
+                "target": "~/.codex/config.toml",
+                "language": "toml",
+                "code": codex_toml,
+            },
+            {
+                "id": "cursor",
+                "label": "Cursor",
+                "target": "~/.cursor/mcp.json",
+                "language": "json",
+                "code": dump(cursor_json),
+            },
+            {
+                "id": "opencode",
+                "label": "OpenCode",
+                "target": "opencode.json",
+                "language": "json",
+                "code": dump(opencode_json),
+            },
+        ],
+    }
+
+
+@app.get("/api/keys")
+async def list_api_keys(user: PublicUser = Depends(require_user)) -> list[dict[str, Any]]:
+    """只返回自己的 Key，且不含明文与哈希。"""
+    from sortie_deck.service import get_api_key_store
+
+    return [k.model_dump(mode="json") for k in get_api_key_store().list_for_user(user.id)]
+
+
+@app.post("/api/keys")
+async def create_api_key(
+    body: CreateApiKeyBody, user: PublicUser = Depends(require_user)
+) -> dict[str, Any]:
+    """创建 Key：明文只在这一次响应里出现，有效期默认 1 个月。"""
+    from sortie_deck.service import get_api_key_store
+
+    if body.expires_in_months not in ALLOWED_TTL_MONTHS:
+        raise HTTPException(
+            400,
+            f"expires_in_months must be one of {list(ALLOWED_TTL_MONTHS)}",
+        )
+    key, plaintext = get_api_key_store().create(
+        user_id=user.id,
+        name=body.name,
+        expires_in_months=body.expires_in_months,
+    )
+    return {
+        "key": key.model_dump(mode="json"),
+        "plaintext": plaintext,
+        "mcp": _mcp_snippet(plaintext),
+    }
+
+
+@app.delete("/api/keys/{key_id}")
+async def delete_api_key(
+    key_id: str, user: PublicUser = Depends(require_user)
+) -> dict[str, str]:
+    """物理删除 Key：记录直接从 sqlite 移除，使用它的客户端立即失效。"""
+    from sortie_deck.service import get_api_key_store
+
+    if not get_api_key_store().delete(user_id=user.id, key_id=key_id):
+        raise HTTPException(404, "key not found")
+    return {"status": "deleted"}
+
+
+@app.get("/api/admin/users")
+async def admin_list_users(_admin: PublicUser = Depends(require_admin)) -> list[dict[str, Any]]:
+    return [u.model_dump() for u in get_auth().list_users()]
+
+
+@app.post("/api/admin/users")
+async def admin_create_user(
+    req: CreateUserRequest, _admin: PublicUser = Depends(require_admin)
+) -> dict[str, Any]:
+    try:
+        return get_auth().create_user(req).model_dump()
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+class AdminUpdateUserRequest(BaseModel):
+    # 可选字段：只传哪个就改哪个；status 用于审核（active=通过 / rejected=拒绝）
+    role: Literal["admin", "member"] | None = None
+    status: Literal["active", "rejected"] | None = None
+
+
+@app.patch("/api/admin/users/{user_id}")
+async def admin_update_user(
+    user_id: str,
+    req: AdminUpdateUserRequest,
+    _admin: PublicUser = Depends(require_admin),
+) -> dict[str, Any]:
+    """管理员修改用户角色 / 审核状态（二选一或同时传）。"""
+    try:
+        if req.role is not None:
+            get_auth().update_role(user_id, req.role)
+        if req.status is not None:
+            get_auth().set_status(user_id, req.status)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except KeyError:
+        raise HTTPException(404, "user not found") from None
+    return get_auth().get_by_id(user_id).model_dump(mode="json", include={"id", "username", "display_name", "role", "status"})
+
+
+@app.delete("/api/admin/users/{user_id}")
+async def admin_delete_user(user_id: str, _admin: PublicUser = Depends(require_admin)) -> dict[str, str]:
+    try:
+        get_auth().delete_user(user_id)
+        return {"status": "deleted"}
+    except KeyError:
+        raise HTTPException(404, "user not found") from None
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/users/search")
+async def search_users(
+    q: str = Query(default=""),
+    _user: PublicUser = Depends(require_user),
+) -> list[dict[str, Any]]:
+    """按账号名 / 显示名 / 用户 id 模糊搜索账号（任务分享面板选人用，最多返回 20 条）。"""
+    kw = q.strip().lower()
+    users = get_auth().list_users()
+    if kw:
+        users = [
+            u
+            for u in users
+            if kw in u.id.lower() or kw in u.username.lower() or kw in (u.display_name or "").lower()
+        ]
+    return [u.model_dump() for u in users[:20]]
+
+
+@app.get("/api/dashboard")
+async def dashboard(user: PublicUser = Depends(require_user)) -> dict[str, Any]:
+    items = _visible_initiatives(orch().list_initiatives(), user)
+    by_status: dict[str, int] = {}
+    for i in items:
+        by_status[i.status.value] = by_status.get(i.status.value, 0) + 1
+    recent = [i.model_dump(mode="json") for i in items[:8]]
+    return {
+        "user": user.model_dump(),
+        "totals": {
+            "initiatives": len(items),
+            "draft": by_status.get("draft", 0),
+            "running": by_status.get("running", 0),
+            "waiting_hitl": by_status.get("waiting_hitl", 0),
+            "done": by_status.get("done", 0),
+            "failed": by_status.get("failed", 0),
+            "stopped": by_status.get("stopped", 0),
+        },
+        "by_status": by_status,
+        "recent": recent,
+    }
+
+
+@app.get("/api/knowledge")
+async def list_knowledge(
+    q: str | None = Query(default=None),
+    base_id: str | None = Query(default=None),
+    user: PublicUser = Depends(require_user),
+) -> list[dict[str, Any]]:
+    """文档目录：始终按所属库的可见性过滤（他人 user/task 库的文档不下发）。"""
+    docs = get_knowledge_gateway().list_catalog(q)
+    default_base = get_knowledge_bases().ensure_default()
+    bases = {b.id: b for b in get_knowledge_bases().list()}
+    visible = _visible_base_ids(user)
+    out: list[dict[str, Any]] = []
+    for d in docs:
+        bid = d.base_id or default_base.id
+        base = bases.get(bid)
+        if base is None:
+            continue
+        if visible is not None and bid not in visible:
+            continue
+        if base_id and bid != base_id:
+            continue
+        out.append(d.model_dump(mode="json"))
+    return out
+
+
+@app.get("/api/knowledge/bases")
+async def list_knowledge_bases(user: PublicUser = Depends(require_user)) -> list[dict[str, Any]]:
+    """知识库列表（按用户可见性过滤），附每个库的文档数。"""
+    bstore = get_knowledge_bases()
+    default_base = bstore.ensure_default()
+    visible = _visible_base_ids(user)
+    counts: dict[str, int] = {}
+    for d in get_knowledge().list():
+        key = d.base_id or default_base.id
+        counts[key] = counts.get(key, 0) + 1
+    return [
+        {**b.model_dump(mode="json"), "doc_count": counts.get(b.id, 0)}
+        for b in bstore.list()
+        if visible is None or b.id in visible
+    ]
+
+
+@app.post("/api/knowledge/bases")
+async def create_knowledge_base(
+    req: CreateKnowledgeBaseRequest, user: PublicUser = Depends(require_user)
+) -> dict[str, Any]:
+    """创建知识库：global 仅 admin；task 必须关联任务且校验任务访问权限。"""
+    if not req.name.strip():
+        raise HTTPException(400, "知识库名称不能为空")
+    if req.scope == "global" and user.role != "admin":
+        raise HTTPException(403, "全局共享知识库仅管理员可创建")
+    if req.scope == "task":
+        if not req.task_id:
+            raise HTTPException(400, "任务知识库必须关联任务")
+        ini = orch().get(req.task_id)
+        if ini is None:
+            raise HTTPException(404, "任务不存在")
+        _ensure_mission_access(ini, user)
+    base = get_knowledge_bases().create(req, user_id=user.id, user_name=user.display_name)
+    return {**base.model_dump(mode="json"), "doc_count": 0}
+
+
+@app.patch("/api/knowledge/bases/{base_id}")
+async def update_knowledge_base(
+    base_id: str, req: UpdateKnowledgeBaseRequest, user: PublicUser = Depends(require_user)
+) -> dict[str, Any]:
+    try:
+        base = get_knowledge_bases().get(base_id)
+    except KeyError:
+        raise HTTPException(404, "knowledge base not found") from None
+    _ensure_base_write(user, base)
+    return get_knowledge_bases().update(base_id, req).model_dump(mode="json")
+
+
+@app.delete("/api/knowledge/bases/{base_id}")
+async def delete_knowledge_base(
+    base_id: str, user: PublicUser = Depends(require_user)
+) -> dict[str, str]:
+    try:
+        base = get_knowledge_bases().get(base_id)
+    except KeyError:
+        raise HTTPException(404, "knowledge base not found") from None
+    _ensure_base_write(user, base)
+    remaining = [d for d in get_knowledge().list() if d.base_id == base_id]
+    if remaining:
+        raise HTTPException(400, f"库内还有 {len(remaining)} 篇文档，请先清空后再删除")
+    get_knowledge_bases().delete(base_id)
+    return {"status": "deleted"}
+
+
+_IMPORT_ALLOWED_EXTS = {
+    ".md", ".markdown", ".txt", ".csv",
+    ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".pdf",
+}
+_IMPORT_TEXT_EXTS = {".md", ".markdown", ".txt", ".csv"}
+# local 模式可用纯 Python 库解析的 OOXML 格式（旧版二进制 .doc/.ppt/.xls 不支持）
+_IMPORT_OFFICE_EXTS = {".docx", ".pptx", ".xlsx"}
+_IMPORT_MAX_BYTES = 50 * 1024 * 1024
+
+
+def _extract_pdf_text(raw: bytes) -> str:
+    """local 后端的 PDF 文本抽取（pypdf 可选依赖）；扫描件/空文档返回空串由调用方报错。"""
+    try:
+        from pypdf import PdfReader
+    except ImportError as exc:
+        raise HTTPException(
+            400, "服务端缺少 pypdf，无法解析 PDF：请在后端环境执行 pip install pypdf，或配置 WeKnora"
+        ) from exc
+    try:
+        reader = PdfReader(io.BytesIO(raw))
+        pages = [(page.extract_text() or "") for page in reader.pages]
+    except Exception as exc:  # noqa: BLE001 — 加密/损坏的 PDF 转为用户可读的 400
+        logger.warning("PDF 解析失败: %s", exc)
+        raise HTTPException(400, f"PDF 解析失败（文件可能损坏或已加密）：{exc}") from exc
+    return "\n\n".join(p for p in pages if p.strip()).strip()
+
+
+@app.post("/api/knowledge/bases/{base_id}/import")
+async def import_knowledge_file(
+    base_id: str,
+    file: UploadFile = File(...),
+    user: PublicUser = Depends(require_user),
+) -> dict[str, Any]:
+    """multipart 文件导入知识库：weknora 模式转交企业库解析；local 模式仅收文本格式。"""
+    try:
+        base = get_knowledge_bases().get(base_id)
+    except KeyError:
+        raise HTTPException(404, "knowledge base not found") from None
+    _ensure_base_write(user, base)
+
+    filename = file.filename or "import.md"
+    ext = Path(filename).suffix.lower()
+    if ext not in _IMPORT_ALLOWED_EXTS:
+        raise HTTPException(400, f"不支持的文件格式：{ext or '（无扩展名）'}")
+    raw = await file.read()
+    if len(raw) > _IMPORT_MAX_BYTES:
+        raise HTTPException(400, "文件超过 50MB 上限")
+
+    title = Path(filename).stem.strip() or filename
+    # 任务知识库的文档自动补 ini:<id> 标签，保证检索时任务命名空间 boost 继续生效
+    tags: list[str] = [f"ini:{base.scope_id}"] if base.scope == "task" else []
+
+    gw = get_knowledge_gateway()
+    if ext in _IMPORT_TEXT_EXTS or (ext == ".pdf" and not gw.uses_weknora):
+        if ext == ".pdf":
+            body = _extract_pdf_text(raw)
+            if not body:
+                raise HTTPException(
+                    400, "未能从 PDF 中提取到文本（可能是纯扫描件）：扫描版 PDF 请配置 WeKnora（OCR）解析"
+                )
+        else:
+            body = raw.decode("utf-8", errors="replace")
+        doc = get_knowledge().create(
+            CreateKnowledgeRequest(
+                title=title, summary="", body=body, tags=tags,
+                category="reference", base_id=base.id,
+            ),
+            author_id=user.id,
+            author_name=user.display_name,
+        )
+        return doc.model_dump(mode="json")
+
+    # local 模式 Office 解析：docx/pptx/xlsx 用纯 Python 库抽取正文（doc_extract.py）
+    if ext in _IMPORT_OFFICE_EXTS and not gw.uses_weknora:
+        try:
+            body = extract_office_text(ext, raw)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        if not body:
+            raise HTTPException(400, f"未能从 {ext} 文件中提取到文本内容（可能是纯图片/空白文档）")
+        doc = get_knowledge().create(
+            CreateKnowledgeRequest(
+                title=title, summary="", body=body, tags=tags,
+                category="reference", base_id=base.id,
+            ),
+            author_id=user.id,
+            author_name=user.display_name,
+        )
+        return doc.model_dump(mode="json")
+
+    if not gw.uses_weknora:
+        raise HTTPException(
+            400,
+            "当前知识库后端为 local，不支持旧版二进制 .doc/.ppt/.xls 格式："
+            "请另存为 docx/pptx/xlsx 后重新导入，或配置 WeKnora（TDT_KB_BACKEND=weknora）解析",
+        )
+    tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
+    try:
+        tmp.write(raw)
+        tmp.close()
+        doc = gw.import_doc(
+            ImportKnowledgeRequest(
+                title=title,
+                file_path=tmp.name,
+                folder_path=f"bases/{base.id}",
+                tags=tags,
+                category="reference",
+                base_id=base.id,
+            ),
+            author_id=user.id,
+            author_name=user.display_name,
+        )
+    except (WeKnoraError, ValueError) as exc:
+        logger.warning("知识库文件导入失败 base=%s file=%s: %s", base_id, filename, exc)
+        raise HTTPException(400, str(exc)) from exc
+    finally:
+        with suppress(OSError):
+            Path(tmp.name).unlink(missing_ok=True)
+    return doc.model_dump(mode="json")
+
+
+@app.get("/api/knowledge/status")
+async def knowledge_status(_user: PublicUser = Depends(require_user)) -> dict[str, Any]:
+    return get_knowledge_gateway().status()
+
+
+@app.get("/api/knowledge/folders")
+async def knowledge_folders(_user: PublicUser = Depends(require_user)) -> Any:
+    try:
+        return get_knowledge_gateway().list_folders()
+    except WeKnoraError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+@app.post("/api/knowledge/retrieve")
+async def knowledge_retrieve(
+    body: dict[str, Any],
+    _user: PublicUser = Depends(require_user),
+) -> dict[str, Any]:
+    query = str(body.get("query") or "").strip()
+    limit = int(body.get("limit") or 6)
+    try:
+        hits = get_knowledge_gateway().retrieve(query, limit=limit)
+    except WeKnoraError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    return {
+        "backend": get_knowledge_gateway().status()["backend"],
+        "hits": [h.model_dump(mode="json") for h in hits],
+    }
+
+
+@app.post("/api/knowledge/sync")
+async def knowledge_sync(user: PublicUser = Depends(require_user)) -> dict[str, Any]:
+    try:
+        return get_knowledge_gateway().sync_catalog(author_name=user.display_name or "WeKnora")
+    except WeKnoraError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+@app.post("/api/knowledge/import")
+async def knowledge_import(
+    req: ImportKnowledgeRequest, user: PublicUser = Depends(require_user)
+) -> dict[str, Any]:
+    try:
+        doc = get_knowledge_gateway().import_doc(
+            req, author_id=user.id, author_name=user.display_name
+        )
+    except (WeKnoraError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return doc.model_dump(mode="json")
+
+
+@app.post("/api/knowledge/bases/{base_id}/refresh-status")
+async def refresh_knowledge_parse_status(
+    base_id: str, user: PublicUser = Depends(require_user)
+) -> list[dict[str, Any]]:
+    """刷新库内文档的 WeKnora 解析状态（前端轮询用；只需库可见性，不需写权限）。"""
+    try:
+        base = get_knowledge_bases().get(base_id)
+    except KeyError:
+        raise HTTPException(404, "knowledge base not found") from None
+    visible = _visible_base_ids(user)
+    if visible is not None and base.id not in visible:
+        raise HTTPException(403, "无权访问该知识库")
+    try:
+        docs = get_knowledge_gateway().refresh_parse_status(base.id)
+    except WeKnoraError as exc:
+        logger.warning("解析状态刷新失败 base=%s: %s", base_id, exc)
+        raise HTTPException(502, str(exc)) from exc
+    return [d.model_dump(mode="json") for d in docs]
+
+
+@app.get("/api/knowledge/{doc_id}")
+async def get_knowledge_doc(doc_id: str, _user: PublicUser = Depends(require_user)) -> dict[str, Any]:
+    try:
+        return get_knowledge_gateway().get(doc_id).model_dump(mode="json")
+    except KeyError:
+        raise HTTPException(404, "document not found") from None
+
+
+@app.post("/api/knowledge")
+async def create_knowledge(
+    req: CreateKnowledgeRequest, user: PublicUser = Depends(require_user)
+) -> dict[str, Any]:
+    """手动建文档：校验目标库写权限；任务库自动补 ini:<id> 标签（检索命名空间）。"""
+    default_base = get_knowledge_bases().ensure_default()
+    try:
+        base = get_knowledge_bases().get(req.base_id or default_base.id)
+    except KeyError:
+        raise HTTPException(404, "knowledge base not found") from None
+    _ensure_base_write(user, base)
+    tags = list(req.tags)
+    task_tag = f"ini:{base.scope_id}"
+    if base.scope == "task" and task_tag not in tags:
+        tags.append(task_tag)
+    req = req.model_copy(update={"base_id": base.id, "tags": tags})
+    try:
+        doc = get_knowledge_gateway().create_local(
+            req, author_id=user.id, author_name=user.display_name
+        )
+    except WeKnoraError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    return doc.model_dump(mode="json")
+
+
+@app.patch("/api/knowledge/{doc_id}")
+async def update_knowledge(
+    doc_id: str, req: UpdateKnowledgeRequest, _user: PublicUser = Depends(require_user)
+) -> dict[str, Any]:
+    try:
+        return get_knowledge_gateway().update(doc_id, req).model_dump(mode="json")
+    except KeyError:
+        raise HTTPException(404, "document not found") from None
+
+
+@app.delete("/api/knowledge/{doc_id}")
+async def delete_knowledge(
+    doc_id: str, user: PublicUser = Depends(require_user)
+) -> dict[str, str]:
+    try:
+        doc = get_knowledge_gateway().get(doc_id)
+        if user.role != "admin" and doc.author_id and doc.author_id != user.id:
+            raise HTTPException(403, "only author or admin can delete")
+        get_knowledge_gateway().delete(doc_id)
+        return {"status": "deleted"}
+    except KeyError:
+        raise HTTPException(404, "document not found") from None
+
+
+@app.get("/api/memory")
+async def list_memory(
+    scope: str | None = Query(default=None),
+    scope_id: str | None = Query(default=None),
+    q: str | None = Query(default=None),
+    include_inactive: bool = Query(default=False),
+    user: PublicUser = Depends(require_user),
+) -> list[dict[str, Any]]:
+    # include_inactive：显式查看 superseded/expired 条目（演变追溯），默认仅生效条目
+    return [
+        m.model_dump(mode="json")
+        for m in get_memory().list(
+            scope=scope, scope_id=scope_id, q=q, user_id=user.id,
+            include_inactive=include_inactive,
+        )
+    ]
+
+
+@app.post("/api/prompts/enhance")
+async def enhance_prompt(
+    req: EnhancePromptRequest, user: PublicUser = Depends(require_user)
+) -> dict[str, str]:
+    """按场景用 LLM 优化用户输入框中的提示词，前端「增强提示词」按钮专用。"""
+    from sortie_deck.prompt_enhance import enhance_prompt as _enhance
+
+    try:
+        enhanced = await _enhance(req)
+    except RuntimeError as exc:
+        if str(exc) == "LLM_NOT_CONFIGURED":
+            raise HTTPException(409, "LLM 未配置，无法优化提示词") from None
+        logger.warning(
+            "提示词优化失败: scene=%s len=%d err=%s: %s", req.scene, len(req.text), type(exc).__name__, exc
+        )
+        raise HTTPException(502, "提示词优化失败，请稍后重试") from None
+    except Exception as exc:  # noqa: BLE001 — LLM 网络等异常统一转 502
+        # err 里带上异常类型：httpx.ReadTimeout 等异常 message 为空，只有类型可定位
+        logger.warning(
+            "提示词优化失败: scene=%s len=%d err=%s: %s", req.scene, len(req.text), type(exc).__name__, exc
+        )
+        raise HTTPException(502, "提示词优化失败，请稍后重试") from None
+    return {"text": enhanced}
+
+
+@app.post("/api/memory")
+async def create_memory(
+    req: CreateMemoryRequest, user: PublicUser = Depends(require_user)
+) -> dict[str, Any]:
+    # workspace 全员共享，写入影响所有任务，仅管理员可创建
+    if req.scope == "workspace" and user.role != "admin":
+        raise HTTPException(403, "workspace 记忆仅管理员可创建")
+    entry = get_memory().create(req, author_id=user.id, author_name=user.display_name)
+
+    # 有 LLM 环境时简介标记为生成中，异步生成完成后落 done / failed；
+    # 无 LLM 环境保持空状态，前端直接展示 content 截断兜底
+    def _llm_enabled() -> bool:
+        try:
+            from sortie_deck.llm import LlmClient
+
+            return LlmClient(timeout=15.0).enabled
+        except Exception:  # noqa: BLE001 — 状态判定失败按无 LLM 处理
+            return False
+
+    if _llm_enabled():
+        entry = get_memory().set_summary_status(entry.id, "pending")
+
+    # 异步生成一句话简介（Claude Code MEMORY.md 模式的索引行）；失败降级为
+    # content 截断（display_summary 兜底），绝不阻塞写入响应
+    async def _fill_summary(entry_id: str, content: str) -> None:
+        try:
+            from sortie_deck.llm import LlmClient
+
+            llm = LlmClient(timeout=15.0)
+            if not llm.enabled:
+                get_memory().set_summary_status(entry_id, "failed")
+                return  # 无 LLM 环境保持截断简介
+            data = await llm.chat_json(
+                system=(
+                    "为一条 Agent 记忆生成不超过 30 字的中文简介，"
+                    "保留约束与适用场景，直接给出简介文本，JSON 格式 {\"summary\": \"...\"}。"
+                ),
+                user=content,
+            )
+            s = str(data.get("summary") or "").strip()
+            if s:
+                get_memory().set_summary(entry_id, s)
+                return
+            # 模型返回了空简介：标记失败让用户可手动重试
+            get_memory().set_summary_status(entry_id, "failed")
+        except Exception:  # noqa: BLE001 — 简介是增强项，失败保持截断
+            logger.warning("记忆简介生成失败，标记 failed 可重试: id=%s", entry_id, exc_info=True)
+            try:
+                get_memory().set_summary_status(entry_id, "failed")
+            except KeyError:
+                pass
+
+    if _llm_enabled():
+        asyncio.create_task(_fill_summary(entry.id, entry.content))
+    return entry.model_dump(mode="json")
+
+
+class MemoryLookupRequest(BaseModel):
+    ids: list[str] = Field(default_factory=list)
+
+
+@app.post("/api/memory/lookup")
+async def lookup_memories(
+    req: MemoryLookupRequest, user: PublicUser = Depends(require_user)
+) -> list[dict[str, Any]]:
+    """按 id 批量取记忆（任务详情页「记忆」面板用）。
+
+    可见性与 /api/memory 列表一致：他人 user 域私密记忆不返回。
+    """
+    if not req.ids:
+        return []
+    known = {e.id: e for e in get_memory().list(user_id=user.id)}
+    return [
+        known[i].model_dump(mode="json")
+        for i in req.ids
+        if i in known
+    ]
+
+
+@app.post("/api/memory/{mem_id}/summary/regenerate")
+async def regenerate_memory_summary(
+    mem_id: str, user: PublicUser = Depends(require_user)
+) -> dict[str, Any]:
+    """重新生成记忆简介：置 pending 并异步调用 LLM，返回最新 entry 供前端展示 loading。"""
+    try:
+        entry = get_memory().get(mem_id)
+        # 权限与 PATCH 一致：workspace 收敛管理员，user 域仅本人或管理员
+        if entry.scope == "workspace" and user.role != "admin":
+            raise HTTPException(403, "workspace 记忆仅管理员可修改")
+        if entry.scope == "user" and entry.scope_id != user.id and user.role != "admin":
+            raise HTTPException(403, "forbidden")
+    except KeyError:
+        raise HTTPException(404, "memory not found") from None
+    from sortie_deck.llm import LlmClient
+
+    llm = LlmClient(timeout=15.0)
+    if not llm.enabled:
+        raise HTTPException(409, "LLM 未配置，无法生成简介")
+    get_memory().set_summary_status(mem_id, "pending")
+
+    async def _fill(entry_id: str, content: str) -> None:
+        try:
+            data = await llm.chat_json(
+                system=(
+                    "为一条 Agent 记忆生成不超过 30 字的中文简介，"
+                    "保留约束与适用场景，直接给出简介文本，JSON 格式 {\"summary\": \"...\"}。"
+                ),
+                user=content,
+            )
+            s = str(data.get("summary") or "").strip()
+            if s:
+                get_memory().set_summary(entry_id, s)
+                return
+            get_memory().set_summary_status(entry_id, "failed")
+        except Exception:  # noqa: BLE001 — 简介是增强项，失败保持截断
+            logger.warning("记忆简介重试失败，标记 failed: id=%s", entry_id, exc_info=True)
+            try:
+                get_memory().set_summary_status(entry_id, "failed")
+            except KeyError:
+                pass
+
+    asyncio.create_task(_fill(mem_id, entry.content))
+    return get_memory().get(mem_id).model_dump(mode="json")
+
+
+@app.patch("/api/memory/{mem_id}")
+async def update_memory(
+    mem_id: str, req: UpdateMemoryRequest, user: PublicUser = Depends(require_user)
+) -> dict[str, Any]:
+    try:
+        entry = get_memory().get(mem_id)
+        # workspace 为全局共享数据，修改/删除收敛到管理员，防止非管理员篡改全员约定
+        if entry.scope == "workspace" and user.role != "admin":
+            raise HTTPException(403, "workspace 记忆仅管理员可修改")
+        if entry.scope == "user" and entry.scope_id != user.id and user.role != "admin":
+            raise HTTPException(403, "forbidden")
+        return get_memory().update(mem_id, req).model_dump(mode="json")
+    except KeyError:
+        raise HTTPException(404, "memory not found") from None
+
+
+@app.delete("/api/memory/{mem_id}")
+async def delete_memory(mem_id: str, user: PublicUser = Depends(require_user)) -> dict[str, str]:
+    try:
+        entry = get_memory().get(mem_id)
+        # workspace 为全局共享数据，删除收敛到管理员（与创建/修改一致）
+        if entry.scope == "workspace" and user.role != "admin":
+            raise HTTPException(403, "workspace 记忆仅管理员可删除")
+        if (
+            user.role != "admin"
+            and entry.author_id
+            and entry.author_id != user.id
+            and not (entry.scope == "user" and entry.scope_id == user.id)
+        ):
+            raise HTTPException(403, "forbidden")
+        get_memory().delete(mem_id)
+        return {"status": "deleted"}
+    except KeyError:
+        raise HTTPException(404, "memory not found") from None
+
+
+@app.get("/api/avatars/presets")
+async def avatar_presets(_user: PublicUser = Depends(require_user)) -> dict[str, Any]:
+    from sortie_deck.avatars import list_avatar_presets
+
+    return {"presets": list_avatar_presets()}
+
+
+class UpdateRoleAvatarRequest(BaseModel):
+    avatar: str = ""
+
+
+@app.patch("/api/initiatives/{initiative_id}/roles/{role_id}")
+async def patch_role_avatar(
+    initiative_id: str,
+    role_id: str,
+    req: UpdateRoleAvatarRequest,
+    user: PublicUser = Depends(require_user),
+) -> dict[str, Any]:
+    try:
+        ini = await orch().update_role_avatar(
+            initiative_id, role_id, req.avatar, author_name=user.display_name
+        )
+        return ini.model_dump(mode="json")
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/initiatives/{initiative_id}/roles/{role_id}/avatar")
+async def upload_role_avatar(
+    initiative_id: str,
+    role_id: str,
+    user: PublicUser = Depends(require_user),
+    file: UploadFile = File(...),
+) -> dict[str, Any]:
+    from sortie_deck.media import save_avatar_image
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(400, "empty file")
+    if len(raw) > 4 * 1024 * 1024:
+        raise HTTPException(400, "avatar too large (max 4MB)")
+    content_type = (file.content_type or "").lower()
+    name = file.filename or "avatar.png"
+    if content_type and not content_type.startswith("image/"):
+        raise HTTPException(400, "only image uploads allowed")
+    if not any(name.lower().endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif")):
+        # still allow if content-type is image/*
+        if not content_type.startswith("image/"):
+            raise HTTPException(400, "unsupported image type")
+    url = save_avatar_image(raw, filename=name)
+    try:
+        ini = await orch().update_role_avatar(
+            initiative_id, role_id, url, author_name=user.display_name
+        )
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return {"avatar": url, "initiative": ini.model_dump(mode="json")}
+
+
+@app.get("/api/media/avatars/{filename}")
+async def get_uploaded_avatar(filename: str) -> FileResponse:
+    from sortie_deck.media import avatars_dir
+
+    safe = Path(filename).name
+    path = avatars_dir() / safe
+    if not path.is_file():
+        raise HTTPException(404, "not found")
+    media = "image/webp" if path.suffix.lower() == ".webp" else "image/png"
+    return FileResponse(path, media_type=media)
+
+
+@app.post("/api/agents/{agent_id}/avatar")
+async def upload_agent_avatar(
+    agent_id: str,
+    user: PublicUser = Depends(require_user),
+    file: UploadFile = File(...),
+) -> dict[str, Any]:
+    from sortie_deck.media import save_avatar_image
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(400, "empty file")
+    if len(raw) > 4 * 1024 * 1024:
+        raise HTTPException(400, "avatar too large (max 4MB)")
+    name = file.filename or "avatar.png"
+    content_type = (file.content_type or "").lower()
+    if content_type and not content_type.startswith("image/"):
+        raise HTTPException(400, "only image uploads allowed")
+    url = save_avatar_image(raw, filename=name)
+    try:
+        from sortie_deck.agents import UpdateAgentRequest
+
+        agent = get_agents().update(
+            agent_id,
+            UpdateAgentRequest(avatar=url),
+            editor_id=user.id,
+            is_admin=user.role == "admin",
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "agent not found") from exc
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    return {"avatar": url, "agent": agent.model_dump(mode="json")}
+
+
+@app.post("/api/media/avatars")
+async def upload_avatar_temp(
+    user: PublicUser = Depends(require_user),
+    file: UploadFile = File(...),
+) -> dict[str, str]:
+    """Upload avatar before agent create; returns URL to embed in create payload."""
+    from sortie_deck.media import save_avatar_image
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(400, "empty file")
+    if len(raw) > 4 * 1024 * 1024:
+        raise HTTPException(400, "avatar too large (max 4MB)")
+    url = save_avatar_image(raw, filename=file.filename or "avatar.png")
+    return {"avatar": url}
+
+
+def _persona_spec_view(payload: dict[str, Any]) -> dict[str, Any]:
+    """补齐 persona_spec：旧数据只有自由文本时，按需解析一份只读结构化视图。"""
+    if not payload.get("persona_spec"):
+        spec = parse_persona(str(payload.get("persona") or ""))
+        if spec.role or spec.skills or spec.constraints:
+            payload["persona_spec"] = spec.model_dump(mode="json")
+    return payload
+
+
+def _agent_json(agent: Any) -> dict[str, Any]:
+    return _persona_spec_view(agent.model_dump(mode="json"))
+
+
+@app.get("/api/agents")
+async def list_agents(
+    q: str | None = Query(default=None),
+    slot: str | None = Query(default=None),
+    user: PublicUser = Depends(require_user),
+) -> list[dict[str, Any]]:
+    return [
+        _agent_json(a)
+        for a in get_agents().list(q=q, slot=slot, user_id=user.id)
+    ]
+
+
+@app.get("/api/agents/{agent_id}")
+async def get_agent(agent_id: str, _user: PublicUser = Depends(require_user)) -> dict[str, Any]:
+    try:
+        return _agent_json(get_agents().get(agent_id))
+    except KeyError:
+        raise HTTPException(404, "agent not found") from None
+
+
+@app.post("/api/agents")
+async def create_agent(
+    req: CreateAgentRequest, user: PublicUser = Depends(require_user)
+) -> dict[str, Any]:
+    try:
+        agent = get_agents().create(req, author_id=user.id, author_name=user.display_name)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return _agent_json(agent)
+
+
+@app.patch("/api/agents/{agent_id}")
+async def update_agent(
+    agent_id: str, req: UpdateAgentRequest, user: PublicUser = Depends(require_user)
+) -> dict[str, Any]:
+    try:
+        agent = get_agents().update(
+            agent_id, req, editor_id=user.id, is_admin=user.role == "admin"
+        )
+    except KeyError:
+        raise HTTPException(404, "agent not found") from None
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return _agent_json(agent)
+
+
+@app.delete("/api/agents/{agent_id}")
+async def delete_agent(agent_id: str, user: PublicUser = Depends(require_user)) -> dict[str, str]:
+    try:
+        get_agents().delete(agent_id, editor_id=user.id, is_admin=user.role == "admin")
+        return {"status": "deleted"}
+    except KeyError:
+        raise HTTPException(404, "agent not found") from None
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
+
+
+class CreateRoleRequest(BaseModel):
+    role_key: str
+    title: str = ""
+    summary: str = ""
+    coding: bool = False
+    executor: str | None = None
+    handoff_targets: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+
+
+class ForgeProposeRequest(BaseModel):
+    capability: str
+    title: str = ""
+    role_key: str | None = None
+    summary: str = ""
+    tags: list[str] = Field(default_factory=list)
+
+
+class ForgeUpdateRequest(BaseModel):
+    title: str | None = None
+    summary: str | None = None
+    persona: str | None = None
+    # 结构化人设：给了就以它为准重新编译 persona（六段式）
+    persona_spec: dict[str, Any] | None = None
+    role_key: str | None = None
+    tags: list[str] | None = None
+    contract: dict[str, Any] | None = None
+
+
+class ForgeApproveRequest(BaseModel):
+    publish_agent: bool = False
+    coding: bool = False
+    toolkit_ids: list[str] = Field(default_factory=list)
+
+
+@app.get("/api/roles")
+async def list_roles(
+    q: str | None = Query(default=None),
+    source: str | None = Query(default=None),
+    _user: PublicUser = Depends(require_user),
+) -> list[dict[str, Any]]:
+    return [s.model_dump(mode="json") for s in get_role_registry().list(q=q, source=source)]
+
+
+@app.post("/api/roles")
+async def create_role(
+    req: CreateRoleRequest, _user: PublicUser = Depends(require_user)
+) -> dict[str, Any]:
+    key = normalize_role_key(req.role_key) or req.role_key
+    try:
+        spec = get_role_registry().register(
+            RoleSpec(
+                role_key=key,
+                title=req.title.strip() or key,
+                summary=req.summary.strip(),
+                source="custom",
+                coding=req.coding,
+                executor=(req.executor or None),
+                handoff_targets=list(req.handoff_targets),
+                tags=[t.strip() for t in req.tags if t.strip()],
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return spec.model_dump(mode="json")
+
+
+@app.delete("/api/roles/{role_key}")
+async def delete_role(role_key: str, _user: PublicUser = Depends(require_user)) -> dict[str, str]:
+    try:
+        get_role_registry().delete(role_key)
+    except KeyError:
+        raise HTTPException(404, "role not found") from None
+    return {"status": "deleted"}
+
+
+def _forge_draft_json(draft: Any) -> dict[str, Any]:
+    return _persona_spec_view(draft.model_dump(mode="json"))
+
+
+@app.get("/api/forge/drafts")
+async def list_forge_drafts(
+    status: str | None = Query(default=None),
+    _user: PublicUser = Depends(require_user),
+) -> list[dict[str, Any]]:
+    return [_forge_draft_json(d) for d in get_agent_forge().list(status=status)]
+
+
+@app.post("/api/forge/drafts")
+async def propose_forge_draft(
+    req: ForgeProposeRequest, user: PublicUser = Depends(require_user)
+) -> dict[str, Any]:
+    draft = await get_agent_forge().propose(
+        ForgeRequest(**req.model_dump(), requested_by=user.display_name)
+    )
+    return _forge_draft_json(draft)
+
+
+@app.get("/api/forge/drafts/{draft_id}")
+async def get_forge_draft(
+    draft_id: str, _user: PublicUser = Depends(require_user)
+) -> dict[str, Any]:
+    try:
+        return _forge_draft_json(get_agent_forge().get(draft_id))
+    except KeyError:
+        raise HTTPException(404, "draft not found") from None
+
+
+@app.patch("/api/forge/drafts/{draft_id}")
+async def update_forge_draft(
+    draft_id: str, req: ForgeUpdateRequest, _user: PublicUser = Depends(require_user)
+) -> dict[str, Any]:
+    try:
+        draft = get_agent_forge().update(draft_id, req.model_dump(exclude_unset=True))
+    except KeyError:
+        raise HTTPException(404, "draft not found") from None
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return _forge_draft_json(draft)
+
+
+@app.post("/api/forge/drafts/{draft_id}/approve")
+async def approve_forge_draft(
+    draft_id: str, req: ForgeApproveRequest, user: PublicUser = Depends(require_user)
+) -> dict[str, Any]:
+    try:
+        draft, role_spec, published = get_agent_forge().approve(
+            draft_id,
+            reviewer=user.display_name,
+            publish_agent=req.publish_agent,
+            toolkit_ids=list(req.toolkit_ids),
+            coding=req.coding,
+        )
+    except KeyError:
+        raise HTTPException(404, "draft not found") from None
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {
+        "draft": _forge_draft_json(draft),
+        "role": role_spec.model_dump(mode="json") if role_spec else None,
+        "agent": _agent_json(published) if published else None,
+    }
+
+
+@app.post("/api/forge/drafts/{draft_id}/reject")
+async def reject_forge_draft(
+    draft_id: str,
+    note: str = Query(default=""),
+    user: PublicUser = Depends(require_user),
+) -> dict[str, Any]:
+    try:
+        draft = get_agent_forge().reject(draft_id, note=note, reviewer=user.display_name)
+    except KeyError:
+        raise HTTPException(404, "draft not found") from None
+    return draft.model_dump(mode="json")
+
+
+@app.get("/api/toolkit")
+async def list_toolkit(
+    kind: str | None = Query(default=None),
+    category: str | None = Query(default=None),
+    q: str | None = Query(default=None),
+    featured: bool | None = Query(default=None),
+    _user: PublicUser = Depends(require_user),
+) -> list[dict[str, Any]]:
+    return [
+        i.model_dump(mode="json")
+        for i in get_toolkit().list(kind=kind, category=category, q=q, featured=featured)
+    ]
+
+
+@app.get("/api/toolkit/mounts")
+async def toolkit_mounts(_user: PublicUser = Depends(require_user)) -> dict[str, int]:
+    """各工具条目被多少个 Agent 挂载（基于 agents 的 toolkit_ids 统计）。
+
+    注意：必须注册在 /api/toolkit/{item_id} 之前，否则 "mounts" 会被当作 item_id。
+    """
+    counts: dict[str, int] = {}
+    for agent in get_agents().list():
+        for tid in agent.toolkit_ids or []:
+            counts[tid] = counts.get(tid, 0) + 1
+    return counts
+
+
+@app.get("/api/toolkit/{item_id}")
+async def get_toolkit_item(item_id: str, _user: PublicUser = Depends(require_user)) -> dict[str, Any]:
+    try:
+        return get_toolkit().get(item_id).model_dump(mode="json")
+    except KeyError:
+        raise HTTPException(404, "toolkit item not found") from None
+
+
+@app.post("/api/toolkit")
+async def create_toolkit_item(
+    req: CreateToolkitRequest, user: PublicUser = Depends(require_user)
+) -> dict[str, Any]:
+    return get_toolkit().create(req, author_id=user.id, author_name=user.display_name).model_dump(
+        mode="json"
+    )
+
+
+@app.patch("/api/toolkit/{item_id}")
+async def update_toolkit_item(
+    item_id: str, req: UpdateToolkitRequest, _user: PublicUser = Depends(require_user)
+) -> dict[str, Any]:
+    try:
+        return get_toolkit().update(item_id, req).model_dump(mode="json")
+    except KeyError:
+        raise HTTPException(404, "toolkit item not found") from None
+
+
+@app.delete("/api/toolkit/{item_id}")
+async def delete_toolkit_item(
+    item_id: str, _user: PublicUser = Depends(require_user)
+) -> dict[str, str]:
+    try:
+        get_toolkit().delete(item_id)
+        return {"status": "deleted"}
+    except KeyError:
+        raise HTTPException(404, "toolkit item not found") from None
+
+
+@app.post("/api/toolkit/import")
+async def import_toolkit(
+    req: ImportToolkitRequest, user: PublicUser = Depends(require_user)
+) -> dict[str, Any]:
+    from sortie_deck.org_policy import assert_import_allowed
+
+    try:
+        assert_import_allowed(orch().org_policy)
+        items = get_toolkit().import_payload(
+            req, author_id=user.id, author_name=user.display_name
+        )
+        return {
+            "imported": len(items),
+            "items": [i.model_dump(mode="json") for i in items],
+        }
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    except (ValueError, json.JSONDecodeError, KeyError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/toolkit/reindex")
+async def reindex_toolkit_index(_user: PublicUser = Depends(require_admin)) -> dict[str, Any]:
+    """全量重建工具箱的 WeKnora 镜像索引（方案 A：混合检索 + rerank）。
+
+    本地 toolkit.json 为准：多退少补。backend 未开 / KB 未配置时返回 skipped。
+    """
+    from sortie_deck.toolkit_index import sync_all
+
+    try:
+        return sync_all(get_toolkit())
+    except Exception as exc:  # noqa: BLE001 — WeKnora 异常转 502 便于前端提示
+        raise HTTPException(502, f"reindex failed: {exc}") from exc
+
+
+# ---------------------------------------------------------------------------
+# V4 工具箱：MCP 测试连接 / 技能安装 / 市场精选 / skill-install 优化 / 挂载计数
+# ---------------------------------------------------------------------------
+
+
+class McpTestRequest(BaseModel):
+    """连接测试入参：与 ToolkitItem 的 mcp 字段对齐，config 走 bearer_token/headers。"""
+
+    transport: Literal["stdio", "sse", "http"] = "stdio"
+    url: str = ""
+    command: str = ""
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
+class InstallSkillRequest(BaseModel):
+    url: str
+    category: str = ""
+    load: Literal["always", "defer"] = "defer"
+
+
+class OptimizeSkillRequest(BaseModel):
+    name: str
+    category: str = ""
+    body: str
+
+
+class ConfirmSkillDraftRequest(BaseModel):
+    keep: Literal["original", "optimized"] = "optimized"
+    load: Literal["always", "defer"] = "defer"
+
+
+class MarketInstallRequest(BaseModel):
+    key: str
+
+
+def _skill_draft_store():
+    from sortie_deck.skill_install import SkillDraftStore
+
+    global _skill_drafts
+    if _skill_drafts is None:
+        _skill_drafts = SkillDraftStore(settings.data_dir / "skill_drafts.json")
+    return _skill_drafts
+
+
+_skill_drafts: Any = None
+
+
+@app.post("/api/toolkit/mcp/test")
+async def test_mcp_connector(
+    req: McpTestRequest, _user: PublicUser = Depends(require_user)
+) -> dict[str, Any]:
+    """连接器连通性测试：按 transport 建临时会话，initialize + tools/list 后立即关闭。"""
+    from sortie_deck.mcp_runtime import _create_session
+    from sortie_deck.toolkit import ToolkitItem
+
+    url = req.url.strip()
+    command = req.command.strip()
+    # 显式校验：避免空 url 的 http/sse 落回 stdio 分支、空命令静默跳过
+    if req.transport in {"sse", "http"} and not url:
+        return {"ok": False, "error": "缺少端点 URL", "log": []}
+    if req.transport == "stdio" and not command:
+        return {"ok": False, "error": "缺少启动命令", "log": []}
+    item = ToolkitItem(
+        id="tk_test",
+        kind="mcp",
+        name="connector-test",
+        transport=req.transport,
+        url=url,
+        command=command,
+        args=list(req.args),
+        env=dict(req.env),
+        config=dict(req.config),
+    )
+    session = _create_session(item)
+    try:
+        await asyncio.wait_for(session.start(), timeout=15)
+        tools = [t.name for t in session.tools]
+        return {"ok": True, "tools": tools, "log": list(session.log)}
+    except Exception as exc:  # noqa: BLE001 — 任何连接失败都转成结构化结果而非 500
+        log = getattr(session, "log", [])
+        logger.warning("mcp test failed (transport=%s url=%s): %s", req.transport, req.url, exc)
+        return {"ok": False, "error": str(exc), "log": list(log)}
+    finally:
+        with suppress(Exception):
+            await session.close()
+
+
+@app.post("/api/toolkit/install_skill")
+async def install_skill_from_web(
+    req: InstallSkillRequest, user: PublicUser = Depends(require_user)
+) -> dict[str, Any]:
+    """从 GitHub 仓库一键安装技能（仅接受仓库地址，不支持 MD 直链）。"""
+    from sortie_deck.skill_install import install_from_github
+
+    try:
+        item_req = await install_from_github(req.url)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    if req.category.strip():
+        item_req.category = req.category.strip()
+    item_req.load = req.load
+    item = get_toolkit().create(item_req, author_id=user.id, author_name=user.display_name)
+    return item.model_dump(mode="json")
+
+
+@app.get("/api/market/skills")
+async def list_market_skills(_user: PublicUser = Depends(require_user)) -> list[dict[str, Any]]:
+    """市场精选目录：内置静态数据 + 按 store 实时标注 installed。"""
+    from sortie_deck.skill_install import MARKET_SKILLS
+
+    installed = {i.name for i in get_toolkit().list(kind="skill")}
+    return [
+        {**entry, "installed": entry["name"] in installed}
+        for entry in MARKET_SKILLS
+    ]
+
+
+@app.post("/api/market/skills/install")
+async def install_market_skill(
+    req: MarketInstallRequest, user: PublicUser = Depends(require_user)
+) -> dict[str, Any]:
+    """安装市场精选技能：已存在时直接返回既有条目（幂等）。"""
+    from sortie_deck.skill_install import market_request
+
+    try:
+        item_req = market_request(req.key)
+    except KeyError:
+        raise HTTPException(404, f"market skill not found: {req.key}") from None
+    existing = [
+        i
+        for i in get_toolkit().list(kind="skill")
+        if i.name == item_req.name
+    ]
+    if existing:
+        return existing[0].model_dump(mode="json")
+    item = get_toolkit().create(item_req, author_id=user.id, author_name=user.display_name)
+    return item.model_dump(mode="json")
+
+
+@app.post("/api/toolkit/optimize_skill")
+async def optimize_skill(
+    req: OptimizeSkillRequest, _user: PublicUser = Depends(require_user)
+) -> dict[str, Any]:
+    """手写 SKILL.md：后台调用 skill-install 优化，双版本草稿落盘待用户选版。"""
+    from sortie_deck.models import utc_now
+    from sortie_deck.skill_install import SkillDraft, optimize_skill_md
+
+    if not req.name.strip() or not req.body.strip():
+        raise HTTPException(400, "name 与 body 均不能为空")
+    optimized, backend = await optimize_skill_md(req.name.strip(), req.body.strip())
+    draft = SkillDraft(
+        name=req.name.strip(),
+        category=req.category.strip(),
+        original=req.body.strip(),
+        optimized=optimized,
+        backend=backend,
+        created_at=utc_now().isoformat(),
+    )
+    _skill_draft_store().save(draft)
+    return draft.model_dump(mode="json")
+
+
+@app.post("/api/toolkit/optimize_skill/{draft_id}/confirm")
+async def confirm_skill_draft(
+    draft_id: str, req: ConfirmSkillDraftRequest, user: PublicUser = Depends(require_user)
+) -> dict[str, Any]:
+    """选版确认：以保留版本创建技能条目，并删除草稿（未选版本从服务器本地存储清除）。"""
+    from sortie_deck.skill_install import SkillDraftStore
+
+    store: SkillDraftStore = _skill_draft_store()
+    try:
+        draft = store.get(draft_id)
+    except KeyError:
+        raise HTTPException(404, "draft not found") from None
+    body = draft.optimized if req.keep == "optimized" else draft.original
+    summary = ""
+    meta_line = next(
+        (ln for ln in body.splitlines() if ln.lower().startswith("description:")), ""
+    )
+    if meta_line:
+        summary = meta_line.split(":", 1)[1].strip()
+    item = get_toolkit().create(
+        CreateToolkitRequest(
+            kind="skill",
+            name=draft.name,
+            summary=summary[:120],
+            body=body,
+            category=draft.category,
+            tags=["skill", "handwritten"],
+            source="handwritten" if req.keep == "original" else f"handwritten+skill-install({draft.backend})",
+            load=req.load,
+        ),
+        author_id=user.id,
+        author_name=user.display_name,
+    )
+    # 未选版本随草稿一并从本地存储删除
+    store.delete(draft_id)
+    return item.model_dump(mode="json")
+
+
+@app.get("/api/executors")
+async def list_executors(_user: PublicUser = Depends(require_user)) -> dict[str, Any]:
+    from sortie_deck.plugins.entrypoints import probe_executor
+
+    registry = orch().registry
+    probes = [probe_executor(registry.get(name)) for name in registry.names()]
+    return {
+        "executors": registry.names(),
+        "probes": probes,
+        "deploy_executor": settings.deploy_executor,
+    }
+
+
+@app.get("/api/harnesses")
+async def list_harnesses(refresh: bool = Query(default=False)) -> dict[str, Any]:
+    """Available agent harness providers + probe status (TTL-cached)."""
+    from sortie_deck.harness_providers import (
+        HARNESS_LABELS,
+        get_harness_registry,
+    )
+
+    registry = get_harness_registry()
+    items: list[dict[str, Any]] = []
+    for name in registry.names():
+        probe = registry.probe(name, refresh=refresh)
+        items.append(
+            {
+                "name": name,
+                "label": HARNESS_LABELS.get(name, name),
+                "probe": probe.as_dict(),
+                "available": probe.ok,
+            }
+        )
+    return {"harnesses": items, "default": settings.default_harness}
+
+
+class UpdateHarnessRequest(BaseModel):
+    harness: str
+
+
+@app.patch("/api/initiatives/{initiative_id}/harness")
+async def patch_initiative_harness(
+    initiative_id: str,
+    req: UpdateHarnessRequest,
+    _user: PublicUser = Depends(_mission_control_guard),
+) -> dict[str, Any]:
+    """Draft-only harness change; started missions require HITL switch_harness."""
+    try:
+        ini = await orch().update_harness(initiative_id, req.harness)
+        return ini.model_dump(mode="json")
+    except KeyError:
+        raise HTTPException(404, "Initiative not found") from None
+    except RuntimeError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+class UpdateMaterialsRequest(BaseModel):
+    materials: list[ExternalMaterial] = Field(default_factory=list)
+
+
+@app.patch("/api/initiatives/{initiative_id}/materials")
+async def patch_initiative_materials(
+    initiative_id: str,
+    req: UpdateMaterialsRequest,
+    _user: PublicUser = Depends(_mission_control_guard),
+) -> dict[str, Any]:
+    """Replace a mission's external materials (recomposes the brief).
+
+    Pinned materials ride along as persistent context in every stage prompt.
+    """
+    try:
+        ini = orch().set_materials(initiative_id, req.materials)
+        return ini.model_dump(mode="json")
+    except KeyError:
+        raise HTTPException(404, "Initiative not found") from None
+
+
+# --- git 凭据 / 仓库（两级模型：workspace 管理员维护，user 仅本人可见）------
+
+
+class GitCredentialBody(BaseModel):
+    label: str = ""
+    host: str
+    scheme: Literal["https", "ssh"] = "https"
+    username: str = ""
+    secret: str
+    expires_at: float | None = None
+
+
+class GitCredentialPatch(BaseModel):
+    """个人凭据可改字段：只开放展示名，匹配键与密钥走覆盖写入。"""
+
+    label: str | None = None
+
+
+class WorkspaceRepoBody(BaseModel):
+    name: str = ""
+    url: str
+    default_branch: str = ""
+    role_slots: list[str] = Field(default_factory=list)
+    credential: GitCredentialBody | None = None
+    credential_id: str | None = None
+
+
+class WorkspaceRepoPatch(BaseModel):
+    name: str | None = None
+    url: str | None = None
+    default_branch: str | None = None
+    role_slots: list[str] | None = None
+    credential_id: str | None = None
+    enabled: bool | None = None
+    credential_id: str | None = None
+
+
+class UserRepoBody(BaseModel):
+    name: str = ""
+    url: str
+    default_branch: str = ""
+    credential_id: str | None = None
+
+
+class UserRepoPatch(BaseModel):
+    name: str | None = None
+    default_branch: str | None = None
+    credential_id: str | None = None
+
+
+class PreflightBody(BaseModel):
+    url: str = ""
+    branch: str = ""
+    repo_id: str | None = None
+    source: str | None = None
+    workspace_repo_id: str | None = None  # @deprecated 用 repo_id + source=workspace
+
+
+def _git_stores():
+    from sortie_deck.git_cred import stores_from_settings
+
+    return stores_from_settings()
+
+
+@app.get("/api/git/workspace-repos")
+async def list_workspace_repos(_user: PublicUser = Depends(require_user)) -> list[dict[str, Any]]:
+    """全员可读的工作区仓库清单（凭证只回 credential_id，不含密钥）。"""
+    _creds, repos, _user_repos = _git_stores()
+    return [r.to_public() for r in repos.list_enabled()]
+
+
+@app.get("/api/git/workspace-credentials")
+async def list_workspace_credentials(
+    _user: PublicUser = Depends(require_user),
+) -> list[dict[str, Any]]:
+    """工作区凭据的只读元信息（全员可见，永不返回 secret）。
+
+    设置页用来看清「这些公用钥匙是谁在维护、绑了哪些仓库」；写入口只存在于
+    管理端 `/api/admin/git/*`，这里刻意不提供任何修改能力。
+    """
+    from sortie_deck.git_cred import SCOPE_WORKSPACE
+
+    creds, _repos, _user_repos = _git_stores()
+    return [
+        c.to_public()
+        for c in creds.list_for_owner(SCOPE_WORKSPACE, "workspace")
+        if c.is_active()
+    ]
+
+
+@app.post("/api/admin/git/workspace-credentials")
+async def admin_upsert_workspace_credential(
+    body: GitCredentialBody, _admin: PublicUser = Depends(require_admin)
+) -> dict[str, Any]:
+    """管理员新增/覆盖工作区凭据（同 host+scheme+username 命中唯一键即覆盖）。
+
+    工作区凭据供所有成员的任务使用；写入口只对管理员开放，且密钥永不读回。
+    """
+    from sortie_deck.git_cred import SCOPE_WORKSPACE, GitCredentialError
+
+    creds, _repos, _user_repos = _git_stores()
+    try:
+        credential = creds.upsert(
+            scope=SCOPE_WORKSPACE,
+            owner_id="workspace",
+            label=body.label or body.host,
+            host=body.host,
+            scheme=body.scheme,
+            username=body.username,
+            secret=body.secret,
+            expires_at=body.expires_at,
+        )
+    except GitCredentialError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return credential.to_public()
+
+
+@app.patch("/api/admin/git/workspace-credentials/{cred_id}")
+async def admin_rename_workspace_credential(
+    cred_id: str, body: GitCredentialPatch, _admin: PublicUser = Depends(require_admin)
+) -> dict[str, Any]:
+    """只改工作区凭据展示名；密钥替换走 POST 覆盖写入。"""
+    from sortie_deck.git_cred import SCOPE_WORKSPACE
+
+    creds, _repos, _user_repos = _git_stores()
+    credential = creds.get(cred_id)
+    if credential is None or credential.scope != SCOPE_WORKSPACE:
+        raise HTTPException(404, "credential not found")
+    label = (body.label or "").strip()
+    if not label:
+        raise HTTPException(400, "label 不能为空")
+    updated = creds.update_label(cred_id, label)
+    if updated is None:
+        raise HTTPException(404, "credential not found")
+    return updated.to_public()
+
+
+@app.delete("/api/admin/git/workspace-credentials/{cred_id}")
+async def admin_disable_workspace_credential(
+    cred_id: str, _admin: PublicUser = Depends(require_admin)
+) -> dict[str, str]:
+    """停用工作区凭据（不物理删除，避免历史任务/仓库引用变成悬空）。"""
+    from sortie_deck.git_cred import SCOPE_WORKSPACE
+
+    creds, _repos, _user_repos = _git_stores()
+    credential = creds.get(cred_id)
+    if credential is None or credential.scope != SCOPE_WORKSPACE:
+        raise HTTPException(404, "credential not found")
+    creds.disable(cred_id)
+    return {"status": "disabled"}
+
+
+@app.post("/api/admin/git/workspace-repos")
+async def admin_create_workspace_repo(
+    body: WorkspaceRepoBody, admin: PublicUser = Depends(require_admin)
+) -> dict[str, Any]:
+    from sortie_deck.git_cred import (
+        SCOPE_WORKSPACE,
+        GitCredentialError,
+        GitRepoError,
+        validate_repo_credential,
+    )
+
+    creds, repos, _user_repos = _git_stores()
+    try:
+        credential_id = body.credential_id
+        if body.credential is not None:
+            credential_id = creds.upsert(
+                scope=SCOPE_WORKSPACE,
+                owner_id="workspace",
+                label=body.credential.label or body.credential.host,
+                host=body.credential.host,
+                scheme=body.credential.scheme,
+                username=body.credential.username,
+                secret=body.credential.secret,
+                expires_at=body.credential.expires_at,
+            ).id
+        if not credential_id:
+            raise HTTPException(400, "credential 或 credential_id 必填")
+        # 工作区仓库只允许工作区凭据，且 host/scheme 必须与仓库 URL 一致
+        validate_repo_credential(
+            body.url, credential_id, credentials=creds, allow_user=False
+        )
+        repo = repos.create(
+            name=body.name,
+            url=body.url,
+            default_branch=body.default_branch,
+            role_slots=body.role_slots,
+            credential_id=credential_id,
+            created_by=admin.id,
+        )
+    except (GitCredentialError, GitRepoError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return repo.to_public()
+
+
+@app.patch("/api/admin/git/workspace-repos/{repo_id}")
+async def admin_update_workspace_repo(
+    repo_id: str, body: WorkspaceRepoPatch, _admin: PublicUser = Depends(require_admin)
+) -> dict[str, Any]:
+    from sortie_deck.git_cred import GitRepoError, validate_repo_credential
+
+    creds, repos, _user_repos = _git_stores()
+    payload = body.model_dump(exclude_none=True)
+    try:
+        current = repos.get(repo_id)
+        if current is None:
+            raise HTTPException(404, "workspace repo not found")
+        if "url" in payload or "credential_id" in payload:
+            validate_repo_credential(
+                payload.get("url", current.url),
+                payload.get("credential_id", current.credential_id) or "",
+                credentials=creds,
+                allow_user=False,
+            )
+        repo = repos.update(repo_id, **payload)
+    except GitRepoError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if repo is None:
+        raise HTTPException(404, "workspace repo not found")
+    return repo.to_public()
+
+
+@app.put("/api/admin/git/workspace-repos/{repo_id}/credential")
+async def admin_set_workspace_credential(
+    repo_id: str, body: GitCredentialBody, _admin: PublicUser = Depends(require_admin)
+) -> dict[str, Any]:
+    """覆盖注入工作区凭据（同 host 覆盖密钥，只写不读）。"""
+    from sortie_deck.git_cred import (
+        SCOPE_WORKSPACE,
+        GitCredentialError,
+        GitRepoError,
+        validate_repo_credential,
+    )
+
+    creds, repos, _user_repos = _git_stores()
+    repo = repos.get(repo_id)
+    if repo is None:
+        raise HTTPException(404, "workspace repo not found")
+    try:
+        credential = creds.upsert(
+            scope=SCOPE_WORKSPACE,
+            owner_id="workspace",
+            label=body.label or body.host,
+            host=body.host,
+            scheme=body.scheme,
+            username=body.username,
+            secret=body.secret,
+            expires_at=body.expires_at,
+        )
+        validate_repo_credential(
+            repo.url, credential.id, credentials=creds, allow_user=False
+        )
+        updated = repos.update(repo_id, credential_id=credential.id)
+    except (GitCredentialError, GitRepoError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"repo": (updated or repo).to_public(), "credential": credential.to_public()}
+
+
+@app.delete("/api/admin/git/workspace-repos/{repo_id}")
+async def admin_disable_workspace_repo(
+    repo_id: str, _admin: PublicUser = Depends(require_admin)
+) -> dict[str, str]:
+    """软删（D4）：置 enabled=0，历史任务引用仍可解析。"""
+    _creds, repos, _user_repos = _git_stores()
+    if repos.update(repo_id, enabled=False) is None:
+        raise HTTPException(404, "workspace repo not found")
+    return {"status": "disabled"}
+
+
+@app.post("/api/admin/git/credentials/{cred_id}/disable")
+async def admin_disable_credential(
+    cred_id: str, _admin: PublicUser = Depends(require_admin)
+) -> dict[str, str]:
+    """安全处置：禁用他人个人凭据（不可读、不可改，D3）。"""
+    creds, _repos, _user_repos = _git_stores()
+    if not creds.disable(cred_id):
+        raise HTTPException(404, "credential not found")
+    return {"status": "disabled"}
+
+
+@app.get("/api/me/git-credentials")
+async def list_my_credentials(user: PublicUser = Depends(require_user)) -> list[dict[str, Any]]:
+    from sortie_deck.git_cred import SCOPE_USER
+
+    creds, _repos, _user_repos = _git_stores()
+    return [c.to_public() for c in creds.list_for_owner(SCOPE_USER, user.id)]
+
+
+@app.post("/api/me/git-credentials")
+async def create_my_credential(
+    body: GitCredentialBody, user: PublicUser = Depends(require_user)
+) -> dict[str, Any]:
+    from sortie_deck.git_cred import SCOPE_USER, GitCredentialError
+
+    creds, _repos, _user_repos = _git_stores()
+    try:
+        credential = creds.upsert(
+            scope=SCOPE_USER,
+            owner_id=user.id,
+            label=body.label or body.host,
+            host=body.host,
+            scheme=body.scheme,
+            username=body.username,
+            secret=body.secret,
+            expires_at=body.expires_at,
+        )
+    except GitCredentialError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return credential.to_public()
+
+
+@app.patch("/api/me/git-credentials/{cred_id}")
+async def update_my_credential_label(
+    cred_id: str, body: GitCredentialPatch, user: PublicUser = Depends(require_user)
+) -> dict[str, Any]:
+    """只改个人凭据的展示名；密钥仍走 POST 覆盖写入。
+
+    密钥写入后不可读回，改名不应该逼用户重新贴一次 token，
+    因此单独开放 label 字段（匹配键保持不变）。
+    """
+    creds, _credential = _my_credential(cred_id, user)
+    label = (body.label or "").strip()
+    if not label:
+        raise HTTPException(400, "label 不能为空")
+    updated = creds.update_label(cred_id, label)
+    if updated is None:
+        raise HTTPException(404, "credential not found")
+    return updated.to_public()
+
+
+def _my_credential(cred_id: str, user: PublicUser):
+    from sortie_deck.git_cred import SCOPE_USER
+
+    creds, _repos, _user_repos = _git_stores()
+    credential = creds.get(cred_id)
+    # 他人凭据一律 404，避免暴露存在性
+    if credential is None or credential.scope != SCOPE_USER or credential.owner_id != user.id:
+        raise HTTPException(404, "credential not found")
+    return creds, credential
+
+
+@app.delete("/api/me/git-credentials/{cred_id}")
+async def delete_my_credential(
+    cred_id: str, user: PublicUser = Depends(require_user)
+) -> dict[str, str]:
+    creds, _credential = _my_credential(cred_id, user)
+    creds.delete(cred_id)
+    return {"status": "deleted"}
+
+
+@app.post("/api/me/git-credentials/{cred_id}/verify")
+async def verify_my_credential(
+    cred_id: str, body: PreflightBody, user: PublicUser = Depends(require_user)
+) -> dict[str, Any]:
+    """探活：用该用户的凭据 `git ls-remote` 一次（不返回密钥）。"""
+    from sortie_deck.git_cred import preflight_git_access, resolver_from_settings
+
+    _creds, _credential = _my_credential(cred_id, user)
+    repo = RepoConfig(url=body.url, branch=body.branch, source="custom")
+    ok, reason = await preflight_git_access(
+        repo, resolver=resolver_from_settings(), actor_user_id=user.id
+    )
+    return {"ok": ok, "reason": reason}
+
+
+@app.get("/api/me/git/repos")
+async def list_my_repos(user: PublicUser = Depends(require_user)) -> list[dict[str, Any]]:
+    _creds, _repos, user_repos = _git_stores()
+    return [r.to_public() for r in user_repos.list_for_owner(user.id)]
+
+
+@app.post("/api/me/git/repos")
+async def create_my_repo(
+    body: UserRepoBody, user: PublicUser = Depends(require_user)
+) -> dict[str, Any]:
+    from sortie_deck.git_cred import (
+        GitCredentialError,
+        GitRepoError,
+        validate_repo_credential,
+    )
+
+    creds, _repos, user_repos = _git_stores()
+    try:
+        if body.credential_id:
+            # host/scheme 强校验：私有仓库可用本人凭据或同 host 的工作区凭据
+            validate_repo_credential(
+                body.url, body.credential_id, credentials=creds, owner_id=user.id
+            )
+        repo = user_repos.create(
+            owner_id=user.id,
+            name=body.name,
+            url=body.url,
+            default_branch=body.default_branch,
+            credential_id=body.credential_id,
+        )
+    except (GitRepoError, GitCredentialError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return repo.to_public()
+
+
+@app.patch("/api/me/git/repos/{repo_id}")
+async def update_my_repo(
+    repo_id: str, body: UserRepoPatch, user: PublicUser = Depends(require_user)
+) -> dict[str, Any]:
+    """本人仓库补绑/改绑凭据与默认分支（任务绑定前必须已绑定）。"""
+    from sortie_deck.git_cred import (
+        GitCredentialError,
+        GitRepoError,
+        validate_repo_credential,
+    )
+
+    creds, _repos, user_repos = _git_stores()
+    repo = user_repos.get_for_owner(user.id, repo_id)
+    if repo is None:
+        raise HTTPException(404, "repo not found")
+    try:
+        if body.credential_id:
+            validate_repo_credential(
+                repo.url, body.credential_id, credentials=creds, owner_id=user.id
+            )
+        updated = user_repos.update(
+            repo_id,
+            owner_id=user.id,
+            name=body.name,
+            default_branch=body.default_branch,
+            credential_id=body.credential_id,
+        )
+    except (GitRepoError, GitCredentialError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if updated is None:
+        raise HTTPException(404, "repo not found")
+    return updated.to_public()
+
+
+@app.delete("/api/me/git/repos/{repo_id}")
+async def delete_my_repo(
+    repo_id: str, user: PublicUser = Depends(require_user)
+) -> dict[str, str]:
+    _creds, _repos, user_repos = _git_stores()
+    if not user_repos.delete(repo_id, owner_id=user.id):
+        raise HTTPException(404, "repo not found")
+    return {"status": "deleted"}
+
+
+@app.post("/api/git/preflight")
+async def git_preflight(
+    body: PreflightBody, user: PublicUser = Depends(require_user)
+) -> dict[str, Any]:
+    """绑定前的连通性/鉴权探活：返回将使用的凭据来源 + ls-remote 结果。"""
+    from sortie_deck.git_cred import preflight_git_access, resolver_from_settings
+
+    _creds, repos, user_repos = _git_stores()
+    source = body.source or ("workspace" if body.workspace_repo_id else "custom")
+    repo_id = body.repo_id or body.workspace_repo_id
+    credential_id = None
+    url = body.url
+    if repo_id:
+        if source == "workspace":
+            row = repos.get(repo_id)
+            if row is None:
+                raise HTTPException(404, "workspace repo not found")
+            credential_id = row.credential_id
+            url = url or row.url
+        else:
+            row = user_repos.get_for_owner(user.id, repo_id)
+            if row is None:
+                raise HTTPException(404, "repo not found")
+            credential_id = row.credential_id
+            url = url or row.url
+        source = "workspace" if source == "workspace" else "custom"
+    repo = RepoConfig(
+        url=url,
+        branch=body.branch,
+        source="workspace" if source == "workspace" else "custom",
+        repo_id=repo_id,
+        credential_id=credential_id,
+    )
+    ok, reason = await preflight_git_access(
+        repo, resolver=resolver_from_settings(), actor_user_id=user.id
+    )
+    return {"ok": ok, "reason": reason, "credential_source": source}
+
+
+class BindReposRequest(BaseModel):
+    role_repos: dict[str, list[RepoConfig]] = Field(default_factory=dict)
+
+
+@app.patch("/api/initiatives/{initiative_id}/repos")
+async def patch_initiative_repos(
+    initiative_id: str,
+    req: BindReposRequest,
+    user: PublicUser = Depends(_mission_control_guard),
+) -> dict[str, Any]:
+    """绑定任务仓库（仅草稿态）。启动后返回 409，需新建任务。
+
+    开发 agent 会先 clone 到 ``workspace/repos/<name>`` 再迭代，并把 diff
+    收进 ``diff.patch``；只在 brief 里写仓库地址不会触发 clone。
+    """
+    from sortie_deck.service import (
+        MissionService,
+        Principal,
+        ServiceError,
+        _clean_role_repos,
+        preflight_role_repos,
+    )
+
+    try:
+        # 先探活再落库：凭据错/网络不通在绑定阶段就报 400，不拖到 coding 阶段
+        await preflight_role_repos(
+            _clean_role_repos(req.role_repos), actor_user_id=user.id
+        )
+        ini = MissionService().bind_repos(
+            Principal(user=user, source="web"), initiative_id, req.role_repos
+        )
+    except ServiceError as exc:
+        raise HTTPException(exc.http_status, exc.message) from exc
+    return ini.model_dump(mode="json")
+
+
+def _mission_input_guard(
+    mission_id: str, user: PublicUser = Depends(require_user)
+) -> PublicUser:
+    """输入快照读写校验。
+
+    规划官会话阶段任务还没写入 ``initiatives`` 表，此时只能按
+    ``chat/planner.state.json`` 的 owner_id 放行；任务已落库后沿用运行控制
+    权限（创建者或被共享用户，admin 只读）。
+    """
+    ini = orch().get(mission_id)
+    if ini is not None:
+        _ensure_mission_control(ini, user)
+        return user
+    try:
+        sess = get_briefing().store.get(mission_id)
+    except KeyError:
+        raise HTTPException(404, "mission not found") from None
+    owner = (sess.owner_id or "").strip()
+    if owner and owner != user.id and user.role != "admin":
+        raise HTTPException(403, "mission input belongs to another user")
+    return user
+
+
+class UpdateMissionInputBody(BaseModel):
+    pinned: bool | None = None
+    # prd | plan | design | data | other（UI 分类）
+    kind: str | None = None
+
+
+@app.get("/api/missions/{mission_id}/input")
+async def list_mission_input(
+    mission_id: str, _user: PublicUser = Depends(_mission_input_guard)
+) -> dict[str, Any]:
+    materials = mission_input.list_materials(Path(settings.data_dir), mission_id)
+    return {"materials": [m.model_dump(mode="json") for m in materials]}
+
+
+@app.post("/api/missions/{mission_id}/input")
+async def upload_mission_input(
+    mission_id: str,
+    file: UploadFile = File(...),
+    kind: str = Form("other"),
+    pinned: bool = Form(False),
+    _user: PublicUser = Depends(_mission_input_guard),
+) -> dict[str, Any]:
+    """上传任务输入原件：落 input/files/ → 抽文本 → 登记 input/manifest.json。"""
+    raw = await file.read()
+    try:
+        material = mission_input.save_upload(
+            Path(settings.data_dir),
+            mission_id,
+            file.filename or "file",
+            raw,
+            kind=(kind or "other").strip() or "other",
+            mime=file.content_type or "",
+            pinned=bool(pinned),
+        )
+    except mission_input.InputTooLarge as exc:
+        raise HTTPException(413, str(exc)) from exc
+    return material.model_dump(mode="json")
+
+
+@app.patch("/api/missions/{mission_id}/input/{material_id}")
+async def update_mission_input(
+    mission_id: str,
+    material_id: str,
+    body: UpdateMissionInputBody,
+    _user: PublicUser = Depends(_mission_input_guard),
+) -> dict[str, Any]:
+    if body.pinned is None and body.kind is None:
+        raise HTTPException(400, "nothing to update")
+    material = mission_input.update_material(
+        Path(settings.data_dir),
+        mission_id,
+        material_id,
+        pinned=body.pinned,
+        kind=body.kind,
+    )
+    if material is None:
+        raise HTTPException(404, "material not found")
+    return material.model_dump(mode="json")
+
+
+@app.delete("/api/missions/{mission_id}/input/{material_id}")
+async def delete_mission_input(
+    mission_id: str,
+    material_id: str,
+    _user: PublicUser = Depends(_mission_input_guard),
+) -> dict[str, Any]:
+    removed = mission_input.remove_material(Path(settings.data_dir), mission_id, material_id)
+    if removed is None:
+        raise HTTPException(404, "material not found")
+    return {"removed": removed.model_dump(mode="json")}
+
+
+@app.get("/api/pipelines")
+async def list_pipelines(_user: PublicUser = Depends(require_user)) -> dict[str, Any]:
+    return {"tracks": list_tracks(), "catalog": stage_catalog()}
+
+
+@app.get("/api/pipelines/suggest")
+async def suggest_pipeline(
+    brief: str = Query(default=""),
+    title: str = Query(default=""),
+    task_kind: str = Query(default="auto", pattern="^(auto|delivery|knowledge)$"),
+    tier: str = Query(default="auto", pattern="^(auto|express|standard|full)$"),
+    _user: PublicUser = Depends(require_user),
+) -> dict[str, Any]:
+    from sortie_deck.pipeline_llm import plan_pipeline_smart
+
+    proposal = await plan_pipeline_smart(
+        title=title,
+        brief=brief,
+        task_kind=task_kind,
+        tier=tier,
+        use_llm=bool(settings.pipeline_llm),
+    )
+    return {
+        "track": proposal.get("track_hint"),
+        "reason": proposal.get("rationale"),
+        "stages": proposal.get("stages", []),
+        "description": proposal.get("rationale", ""),
+        "proposal": proposal,
+    }
+
+
+@app.get("/api/pipelines/catalog")
+async def get_stage_catalog(_user: PublicUser = Depends(require_user)) -> dict[str, Any]:
+    return {"stages": stage_catalog()}
+
+
+@app.get("/api/pipelines/tiers")
+async def get_pipeline_tiers(
+    task_kind: str | None = Query(default=None, pattern="^(delivery|knowledge)$"),
+    _user: PublicUser = Depends(require_user),
+) -> dict[str, Any]:
+    """建任务页的档位数据：开发/办公两套各三档，含阶段链路与预估时长。"""
+    from sortie_deck.tiers import list_tier_definitions
+
+    return {"task_kinds": list_tier_definitions(task_kind, catalog_by_id())}
+
+
+# --- 耗时分析（严格只看自己创建的任务） --------------------------------------
+
+
+def _ensure_metrics_owner(ini: Any, user: PublicUser) -> None:
+    """耗时分析严格按创建者：admin 与共享用户都不放行。
+
+    与任务列表口径不同（那里 admin 可见全部、共享用户可见被共享任务），
+    这里按产品要求只允许本人查看自己创建的任务耗时。
+    """
+    if getattr(ini, "created_by", None) != user.id:
+        raise HTTPException(403, "只能查看自己创建的任务耗时")
+
+
+def _insight_mission_brief(ini: Any) -> dict[str, Any]:
+    return {
+        "id": ini.id,
+        "title": ini.title,
+        "status": ini.status.value,
+        "current_stage": ini.current_stage,
+        "created_at": ini.created_at.isoformat(),
+        "updated_at": ini.updated_at.isoformat(),
+    }
+
+
+def _insight_stages_payload(stages: list[dict[str, Any]]) -> dict[str, Any]:
+    """阶段明细 + 相对时间轴：offset_ms 以首个阶段起点为 0，供甘特图定位。"""
+    if not stages:
+        return {"stages": [], "span": None}
+    start = min(float(s["started_at"]) for s in stages)
+    end = max(float(s["ended_at"]) for s in stages)
+    return {
+        "stages": [
+            {
+                "stage": s["stage"],
+                "role": s["role"],
+                "harness": s["harness"],
+                "attempt": s["attempt"],
+                "status": s["status"],
+                "started_at": s["started_at"],
+                "ended_at": s["ended_at"],
+                "offset_ms": int((float(s["started_at"]) - start) * 1000),
+                "duration_ms": s["duration_ms"],
+                "tool_calls": s["tool_calls"],
+                "review_rounds": s["review_rounds"],
+                "review_verdict": s["review_verdict"],
+                "meta": s["meta"],
+            }
+            for s in stages
+        ],
+        "span": {
+            "started_at": start,
+            "ended_at": end,
+            "duration_ms": int((end - start) * 1000),
+        },
+    }
+
+
+@app.get("/api/insights/missions")
+async def list_insight_missions(
+    limit: int = Query(default=100, ge=1, le=300),
+    user: PublicUser = Depends(require_user),
+) -> dict[str, Any]:
+    """当前用户创建的任务 + 阶段指标聚合（含执行起止，供列表展示）。"""
+    items = [
+        i
+        for i in orch().list_initiatives()
+        if getattr(i, "created_by", None) == user.id
+    ]
+    items.sort(key=lambda i: i.updated_at, reverse=True)
+    items = items[:limit]
+    agg = orch().metrics.list_missions([i.id for i in items])
+    missions: list[dict[str, Any]] = []
+    for ini in items:
+        metrics = agg.get(ini.id) or {}
+        # 首/末阶段时刻取自聚合结果，0 表示该任务无指标（功能上线前创建），返回 None 让前端显示占位符
+        first_started = float(metrics.get("first_started_at") or 0)
+        last_ended = float(metrics.get("last_ended_at") or 0)
+        missions.append(
+            {
+                **_insight_mission_brief(ini),
+                "has_metrics": bool(metrics),
+                "stage_count": int(metrics.get("stage_count") or 0),
+                "total_duration_ms": int(metrics.get("total_duration_ms") or 0),
+                "tool_calls": int(metrics.get("tool_calls") or 0),
+                "review_rounds": int(metrics.get("review_rounds") or 0),
+                "first_started_at": first_started or None,
+                "last_ended_at": last_ended or None,
+            }
+        )
+    return {
+        "missions": missions,
+        "totals": {
+            "mission_count": len(missions),
+            "total_duration_ms": sum(m["total_duration_ms"] for m in missions),
+            "tool_calls": sum(m["tool_calls"] for m in missions),
+            "review_rounds": sum(m["review_rounds"] for m in missions),
+        },
+    }
+
+
+@app.get("/api/insights/missions/{initiative_id}")
+async def get_insight_mission(
+    initiative_id: str, user: PublicUser = Depends(require_user)
+) -> dict[str, Any]:
+    """单任务阶段明细，供单任务甘特图。"""
+    ini = orch().get(initiative_id)
+    if not ini:
+        raise HTTPException(404, "Initiative not found")
+    _ensure_metrics_owner(ini, user)
+    return {
+        "mission": _insight_mission_brief(ini),
+        **_insight_stages_payload(orch().metrics.list_stages(initiative_id)),
+    }
+
+
+@app.get("/api/insights/compare")
+async def compare_insight_missions(
+    ids: str = Query(..., description="逗号分隔的任务 id，最多 5 个"),
+    user: PublicUser = Depends(require_user),
+) -> dict[str, Any]:
+    """多任务对比：每个任务各自以首个阶段为 0 点，前端共用一条相对时间轴。"""
+    id_list = [x.strip() for x in ids.split(",") if x.strip()][:5]
+    if len(id_list) < 2:
+        raise HTTPException(400, "至少选择 2 个任务进行对比")
+    missions: list[dict[str, Any]] = []
+    for mid in id_list:
+        ini = orch().get(mid)
+        if not ini:
+            raise HTTPException(404, f"任务不存在: {mid}")
+        _ensure_metrics_owner(ini, user)
+        missions.append(
+            {
+                "mission": _insight_mission_brief(ini),
+                **_insight_stages_payload(orch().metrics.list_stages(mid)),
+            }
+        )
+    return {"missions": missions}
+
+
+@app.get("/api/initiatives")
+async def list_initiatives(
+    status: str | None = Query(default=None),
+    mine: bool = Query(default=False, description="只看我创建的（CLI 解析\u300c最新任务\u300d用）"),
+    limit: int | None = Query(default=None, ge=1, le=500),
+    user: PublicUser = Depends(require_user),
+) -> list[dict[str, Any]]:
+    items = _visible_initiatives(orch().list_initiatives(), user)
+    if mine:
+        items = [i for i in items if getattr(i, "created_by", None) == user.id]
+    if status:
+        items = [i for i in items if i.status.value == status]
+    if limit:
+        items = items[:limit]
+    return [i.model_dump(mode="json") for i in items]
+
+
+@app.post("/api/initiatives")
+async def create_initiative(
+    req: CreateInitiativeRequest, user: PublicUser = Depends(require_user)
+) -> dict[str, Any]:
+    if not req.creator_name or req.creator_name == "Operator":
+        req.creator_name = user.display_name
+    # 多租户归属：记录创建者用户 id（workspace/删除等敏感操作校验用）
+    req.created_by = user.id
+    ini = await orch().create_initiative(req)
+    await asyncio.sleep(0.15)
+    fresh = orch().get(ini.id) or ini
+    return fresh.model_dump(mode="json")
+
+
+class BriefingMessageBody(BaseModel):
+    text: str = ""
+    attachments: list[dict[str, Any]] = Field(default_factory=list)
+    materials: list[ExternalMaterial] = Field(default_factory=list)
+
+
+def _guard_briefing_owner(sess: Any, user: PublicUser) -> None:
+    """建队会话尚未写入 initiatives 表，只能用 planner.state.json 的 owner_id 鉴权。"""
+    owner = (getattr(sess, "owner_id", "") or "").strip()
+    if owner and owner != user.id and user.role != "admin":
+        raise HTTPException(403, "briefing session belongs to another user")
+
+
+def _load_briefing_session(session_id: str) -> Any:
+    try:
+        return get_briefing().store.get(session_id)
+    except KeyError:
+        raise HTTPException(404, "briefing session not found") from None
+
+
+@app.post("/api/briefing/sessions")
+async def start_briefing(user: PublicUser = Depends(require_user)) -> dict[str, Any]:
+    # 会话发起人即任务归属人：确认建队时写入 created_by（见 MissionBriefingAgent._commit）
+    sess = get_briefing().start(owner_id=user.id)
+    payload = sess.model_dump(mode="json")
+    # 任务 id 在会话开启时已预生成，session_id 与 initiative_id 是同一个值，
+    # 前端后续所有请求都可以直接用 initiative_id（不再有「先会话后建队」的映射）。
+    payload["session_id"] = sess.id
+    payload["initiative_id"] = sess.id
+    return payload
+
+
+@app.get("/api/briefing/sessions/{session_id}")
+async def get_briefing_session(
+    session_id: str, user: PublicUser = Depends(require_user)
+) -> dict[str, Any]:
+    sess = _load_briefing_session(session_id)
+    _guard_briefing_owner(sess, user)
+    return sess.model_dump(mode="json")
+
+
+@app.post("/api/briefing/sessions/{session_id}/messages")
+async def post_briefing_message(
+    session_id: str,
+    body: BriefingMessageBody,
+    request: Request,
+    user: PublicUser = Depends(require_user),
+) -> dict[str, Any]:
+    from sortie_deck.mission_briefing import BriefingAttachment
+
+    atts = [BriefingAttachment.model_validate(a) for a in (body.attachments or [])]
+    _guard_briefing_owner(_load_briefing_session(session_id), user)
+    # Run planning as a task so a client abort ("stop" button) cancels it.
+    task = asyncio.create_task(
+        get_briefing().handle(
+            session_id,
+            body.text,
+            user_name=user.display_name or user.username,
+            user_id=user.id,
+            attachments=atts,
+            materials=list(body.materials or []),
+        )
+    )
+    while True:
+        done, _ = await asyncio.wait({task}, timeout=0.4)
+        if done:
+            break
+        if await request.is_disconnected():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+            raise HTTPException(499, "briefing interrupted") from None
+    try:
+        sess = task.result()
+    except asyncio.CancelledError:
+        raise HTTPException(499, "briefing interrupted") from None
+    except KeyError:
+        raise HTTPException(404, "briefing session not found") from None
+    return sess.model_dump(mode="json")
+
+
+class BriefingReposBody(BaseModel):
+    role_repos: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
+
+
+@app.patch("/api/briefing/sessions/{session_id}/repos")
+async def set_briefing_repos(
+    session_id: str,
+    body: BriefingReposBody,
+    user: PublicUser = Depends(require_user),
+) -> dict[str, Any]:
+    """Attach per-slot git/github repos & branches to the pending briefing draft.
+
+    Called before the briefing confirm; each slot's dev agent clones & reads
+    these repos in its workspace before iterating.
+    """
+    _guard_briefing_owner(_load_briefing_session(session_id), user)
+    try:
+        sess = get_briefing().set_role_repos(session_id, body.role_repos)
+    except KeyError:
+        raise HTTPException(404, "briefing session not found") from None
+    return sess.model_dump(mode="json")
+
+
+class BriefingPrefsBody(BaseModel):
+    # 建任务页选择的档位：auto 表示交给后端规则推荐
+    task_kind: str | None = None
+    tier: str | None = None
+
+
+@app.patch("/api/briefing/sessions/{session_id}/prefs")
+async def set_briefing_prefs(
+    session_id: str,
+    body: BriefingPrefsBody,
+    user: PublicUser = Depends(require_user),
+) -> dict[str, Any]:
+    """保存档位选择；确认建队时据此生成预算内的航线。"""
+    sess = _load_briefing_session(session_id)
+    _guard_briefing_owner(sess, user)
+    if body.task_kind in {"auto", "delivery", "knowledge"}:
+        sess.task_kind = body.task_kind
+    if body.tier in {"auto", "express", "standard", "full"}:
+        sess.tier = body.tier
+    get_briefing().store.save(sess)
+    return sess.model_dump(mode="json")
+
+
+@app.get("/api/initiatives/{initiative_id}")
+async def get_initiative(
+    initiative_id: str, user: PublicUser = Depends(require_user)
+) -> dict[str, Any]:
+    ini = orch().get(initiative_id)
+    if not ini:
+        raise HTTPException(404, "Initiative not found")
+    _ensure_mission_access(ini, user)
+    return ini.model_dump(mode="json")
+
+
+@app.delete("/api/initiatives/{initiative_id}")
+async def delete_initiative(
+    initiative_id: str, user: PublicUser = Depends(require_user)
+) -> dict[str, str]:
+    ini = orch().get(initiative_id)
+    if not ini:
+        raise HTTPException(404, "Initiative not found")
+    # 解散：仅创建者或 admin（admin 对他人任务只读，但保留解散能力）
+    _ensure_mission_delete(ini, user)
+    try:
+        await orch().delete_initiative(initiative_id)
+        return {"status": "deleted"}
+    except KeyError:
+        raise HTTPException(404, "Initiative not found") from None
+
+
+class AddMissionShareRequest(BaseModel):
+    # 被分享的目标用户 id（来自 /api/users/search 结果）
+    user_id: str
+
+
+@app.get("/api/initiatives/{initiative_id}/shares")
+async def list_mission_shares(
+    initiative_id: str, user: PublicUser = Depends(require_user)
+) -> list[dict[str, Any]]:
+    """任务共享成员列表：创建者与被共享用户均可见。"""
+    ini = orch().get(initiative_id)
+    if not ini:
+        raise HTTPException(404, "Initiative not found")
+    _ensure_mission_access(ini, user)
+    return [s.model_dump(mode="json") for s in ini.shared_with]
+
+
+@app.post("/api/initiatives/{initiative_id}/shares")
+async def add_mission_share(
+    initiative_id: str,
+    req: AddMissionShareRequest,
+    user: PublicUser = Depends(require_user),
+) -> dict[str, Any]:
+    """共享任务给指定账号用户（仅创建者可操作；重复共享幂等返回）。"""
+    ini = orch().get(initiative_id)
+    if not ini:
+        raise HTTPException(404, "Initiative not found")
+    _ensure_mission_share_owner(ini, user)
+    target = get_auth().get_by_id(req.user_id)
+    if not target:
+        raise HTTPException(404, "user not found")
+    if target.id == ini.created_by:
+        raise HTTPException(400, "cannot share to the mission owner")
+    if not _is_mission_shared_with(ini, target.id):
+        ini.shared_with.append(
+            MissionShare(
+                user_id=target.id,
+                username=target.username,
+                display_name=target.display_name,
+                added_by=user.id,
+            )
+        )
+        orch().store.upsert(ini)
+        logger.info("任务共享已添加: initiative=%s user=%s by=%s", initiative_id, target.id, user.id)
+    return ini.model_dump(mode="json")
+
+
+@app.delete("/api/initiatives/{initiative_id}/shares/{share_user_id}")
+async def remove_mission_share(
+    initiative_id: str,
+    share_user_id: str,
+    user: PublicUser = Depends(require_user),
+) -> dict[str, Any]:
+    """取消共享：仅创建者可移除任意成员，被共享用户可移除自己（退出共享）。"""
+    ini = orch().get(initiative_id)
+    if not ini:
+        raise HTTPException(404, "Initiative not found")
+    is_owner = bool(ini.created_by and ini.created_by == user.id)
+    if not is_owner and share_user_id != user.id:
+        raise HTTPException(403, "仅任务创建者可移除其他共享成员")
+    if _is_mission_shared_with(ini, share_user_id):
+        ini.shared_with = [s for s in ini.shared_with if s.user_id != share_user_id]
+        orch().store.upsert(ini)
+        logger.info("任务共享已取消: initiative=%s user=%s by=%s", initiative_id, share_user_id, user.id)
+    return ini.model_dump(mode="json")
+
+
+@app.get("/api/initiatives/{initiative_id}/memories")
+async def mission_memories(
+    initiative_id: str, user: PublicUser = Depends(_mission_access_guard)
+) -> dict[str, Any]:
+    """任务记忆面板数据：生成时绑定的记忆 + Agent 执行中实际读取的记录。"""
+    ini = orch().get(initiative_id)
+    if not ini:
+        raise HTTPException(404, "Initiative not found")
+    bound_ids = [str(i) for i in (ini.meta or {}).get("memory_ids", [])]
+    known = {e.id: e for e in get_memory().list(user_id=user.id)}
+    bound = [known[i].model_dump(mode="json") for i in bound_ids if i in known]
+    # 执行中读取记录：Agent 取全文后追加 usage.log（best-effort，可能不存在）
+    read_ids: list[str] = []
+    try:
+        from sortie_deck.mission_memory import get_mission_memory
+
+        log = get_mission_memory().usage_log(initiative_id)
+        if log.exists():
+            read_ids = [ln.strip() for ln in log.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    except Exception:  # noqa: BLE001 — 使用记录只是增强
+        read_ids = []
+    return {"bound": bound, "read_ids": read_ids}
+
+
+@app.post("/api/initiatives/{initiative_id}/start")
+async def start_initiative(
+    initiative_id: str, user: PublicUser = Depends(_mission_control_guard)
+) -> dict[str, Any]:
+    from sortie_deck.service import ServiceError, _clean_role_repos, preflight_role_repos
+
+    try:
+        # 启动前再探一次：绑定后管理员可能轮换了凭据，避免带着失效凭据进入 coding
+        current = orch().get(initiative_id)
+        if current is not None:
+            await preflight_role_repos(
+                _clean_role_repos((current.meta or {}).get("role_repos")),
+                actor_user_id=user.id,
+            )
+        ini = await orch().start_pipeline(initiative_id, author_name=user.display_name)
+        await asyncio.sleep(0.2)
+        return (orch().get(ini.id) or ini).model_dump(mode="json")
+    except KeyError:
+        raise HTTPException(404, "Initiative not found") from None
+    except ServiceError as exc:
+        raise HTTPException(exc.http_status, exc.message) from exc
+    except ForgeReviewRequiredError as exc:
+        # 409：任务本身合法，只是缺一步人工审核（审核通过后可直接重试 /start）
+        raise HTTPException(
+            409,
+            detail={
+                "code": exc.code,
+                "message": exc.message,
+                "draft_ids": exc.draft_ids,
+            },
+        ) from exc
+    except PipelineNotConfirmedError as exc:
+        raise HTTPException(
+            400,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
+    except RuntimeError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.patch("/api/initiatives/{initiative_id}/pipeline")
+async def patch_pipeline(
+    initiative_id: str,
+    req: UpdatePipelineRequest,
+    user: PublicUser = Depends(_mission_control_guard),
+) -> dict[str, Any]:
+    try:
+        ini = await orch().update_pipeline(initiative_id, req, author_name=user.display_name)
+        return ini.model_dump(mode="json")
+    except KeyError:
+        raise HTTPException(404, "Initiative not found") from None
+    except RuntimeError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/initiatives/{initiative_id}/pipeline/confirm")
+async def confirm_pipeline_route(
+    initiative_id: str,
+    req: ConfirmPipelineRequest | None = None,
+    user: PublicUser = Depends(_mission_control_guard),
+) -> dict[str, Any]:
+    try:
+        ini = await orch().confirm_pipeline(
+            initiative_id, req or ConfirmPipelineRequest(), author_name=user.display_name
+        )
+        return ini.model_dump(mode="json")
+    except KeyError:
+        raise HTTPException(404, "Initiative not found") from None
+    except RuntimeError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/initiatives/{initiative_id}/hitl")
+async def submit_hitl(
+    initiative_id: str, req: HitlSubmitRequest, user: PublicUser = Depends(_mission_control_guard)
+) -> dict[str, Any]:
+    try:
+        # 「撤退」常误打到 /hitl；stop 在任意状态下都走专用路径
+        if req.action == HitlAction.STOP:
+            ini = await orch().stop(
+                initiative_id,
+                author_name=req.author_name or user.display_name,
+                source=req.source,
+            )
+            return ini.model_dump(mode="json")
+        decision = HitlDecision(
+            action=req.action,
+            instruction=req.instruction,
+            next_stage=req.next_stage,
+            note=req.note,
+            harness=req.harness,
+            source=req.source,
+        )
+        ini = await orch().submit_hitl(
+            initiative_id, decision, author_name=req.author_name or user.display_name
+        )
+        return ini.model_dump(mode="json")
+    except KeyError:
+        raise HTTPException(404, "Initiative not found") from None
+    except RuntimeError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/initiatives/{initiative_id}/stop")
+async def stop_initiative(
+    initiative_id: str, user: PublicUser = Depends(_mission_control_guard)
+) -> dict[str, Any]:
+    try:
+        ini = await orch().stop(initiative_id, author_name=user.display_name)
+        return ini.model_dump(mode="json")
+    except KeyError:
+        raise HTTPException(404, "Initiative not found") from None
+
+
+def _squad_payload(initiative_id: str) -> dict[str, Any]:
+    ini = orch().get(initiative_id)
+    if not ini:
+        raise HTTPException(404, "Initiative not found")
+    messages = orch().list_room_messages(initiative_id)
+    return {
+        "initiative_id": initiative_id,
+        "squad_id": ini.room_id,
+        "room_id": ini.room_id,
+        "participants": [p.model_dump(mode="json") for p in ini.participants],
+        "messages": [m.model_dump(mode="json") for m in messages],
+    }
+
+
+@app.get("/api/initiatives/{initiative_id}/squad")
+@app.get("/api/initiatives/{initiative_id}/room")
+async def get_squad(
+    initiative_id: str, _user: PublicUser = Depends(_mission_access_guard)
+) -> dict[str, Any]:
+    return _squad_payload(initiative_id)
+
+
+@app.post("/api/initiatives/{initiative_id}/squad/join")
+@app.post("/api/initiatives/{initiative_id}/room/join")
+async def join_squad(
+    initiative_id: str, req: JoinRoomRequest, user: PublicUser = Depends(_mission_control_guard)
+) -> dict[str, Any]:
+    try:
+        name = req.name or user.display_name
+        ini = await orch().join_room(initiative_id, name, req.title or user.role)
+        return ini.model_dump(mode="json")
+    except KeyError:
+        raise HTTPException(404, "Initiative not found") from None
+
+
+@app.post("/api/initiatives/{initiative_id}/squad/discuss")
+@app.post("/api/initiatives/{initiative_id}/room/discuss")
+async def set_squad_discussing(
+    initiative_id: str,
+    req: DiscussParticipateRequest,
+    user: PublicUser = Depends(_mission_control_guard),
+) -> dict[str, Any]:
+    try:
+        ini = await orch().set_discussing(
+            initiative_id,
+            discussing=req.discussing,
+            participant_id=req.participant_id,
+            role=req.role,
+            name=req.name or (None if req.participant_id or req.role else user.display_name),
+            actor_name=user.display_name,
+        )
+        return ini.model_dump(mode="json")
+    except KeyError:
+        raise HTTPException(404, "Initiative not found") from None
+    except RuntimeError as exc:
+        raise HTTPException(400, str(exc)) from None
+
+
+@app.post("/api/initiatives/{initiative_id}/squad/messages")
+@app.post("/api/initiatives/{initiative_id}/room/messages")
+async def post_squad_message(
+    initiative_id: str,
+    req: PostRoomMessageRequest,
+    user: PublicUser = Depends(_mission_control_guard),
+) -> dict[str, Any]:
+    try:
+        msg, ini = await orch().post_human_message(
+            initiative_id,
+            req.text,
+            author_name=req.author_name or user.display_name,
+            author_id=req.author_id or user.id,
+        )
+        return {
+            "message": msg.model_dump(mode="json"),
+            "initiative": ini.model_dump(mode="json") if ini else None,
+        }
+    except KeyError:
+        raise HTTPException(404, "Initiative not found") from None
+    except RuntimeError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+def _binary_artifact_response(rel: str) -> FileResponse:
+    """二进制产物（如 code-archive 的 zip）转附件下载。
+
+    read_text 读二进制会 UnicodeDecodeError，无法走 JSON 预览；这里按
+    Content-Disposition: attachment 返回文件流，浏览器直接触发下载。
+    """
+    store = orch().artifacts
+    absolute = getattr(store, "absolute", None)
+    if absolute is None:
+        raise HTTPException(409, "binary artifact download requires the local artifact backend")
+    path = absolute(rel)
+    if not path.is_file():
+        raise HTTPException(404, "Artifact not found")
+    media = "application/zip" if path.suffix == ".zip" else "application/octet-stream"
+    return FileResponse(
+        path,
+        media_type=media,
+        headers={"Content-Disposition": f'attachment; filename="{path.name}"'},
+    )
+
+
+@app.get("/api/initiatives/{initiative_id}/artifacts/{artifact_path:path}")
+async def read_artifact(
+    initiative_id: str, artifact_path: str, _user: PublicUser = Depends(_mission_access_guard)
+) -> dict[str, Any]:
+    from sortie_deck.artifacts import ArtifactPathError
+    from sortie_deck.service import artifact_candidates
+
+    ini = orch().get(initiative_id)
+    if not ini:
+        raise HTTPException(404, "Initiative not found")
+    # 与 MCP / CLI 共用同一套路径解析：完整存储路径、stage/file、文件名都接受
+    content: str | None = None
+    rel = artifact_path
+    for candidate in artifact_candidates(initiative_id, artifact_path):
+        try:
+            content = orch().artifacts.read_text(candidate)
+            rel = candidate
+            break
+        except ArtifactPathError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except UnicodeDecodeError:
+            return _binary_artifact_response(candidate)
+        except FileNotFoundError:
+            continue
+    if content is None:
+        # 只给文件名时按产物列表唯一匹配（与 MissionService 的行为保持一致）
+        name = (artifact_path or "").strip().lstrip("/")
+        unique = list(
+            dict.fromkeys(
+                str(a.path)
+                for a in ini.artifacts
+                if name and "/" not in name and (str(a.path).endswith("/" + name) or a.kind == name)
+            )
+        )
+        if len(unique) == 1:
+            rel = unique[0]
+            try:
+                content = orch().artifacts.read_text(rel)
+            except UnicodeDecodeError:
+                return _binary_artifact_response(rel)
+        elif len(unique) > 1:
+            raise HTTPException(409, f"同名产物有多个，请写完整路径: {', '.join(unique)}")
+    if content is None:
+        raise HTTPException(404, "Artifact not found")
+    return {"path": rel, "content": content}
+
+
+@app.get("/api/initiatives/{initiative_id}/workspace")
+async def initiative_workspace(
+    initiative_id: str, user: PublicUser = Depends(_mission_access_guard)
+) -> dict[str, Any]:
+    from sortie_deck.workspace import mission_workspace
+
+    ini = orch().get(initiative_id)
+    if not ini:
+        raise HTTPException(404, "Initiative not found")
+    return mission_workspace(
+        initiative_id=initiative_id,
+        data_dir=orch().cfg.data_dir,
+        repo_root=orch().cfg.data_dir.parent,
+    )
+
+
+class RevealPathBody(BaseModel):
+    path: str
+    select_file: bool = False
+
+
+@app.post("/api/system/reveal")
+async def reveal_path(body: RevealPathBody, _user: PublicUser = Depends(require_user)) -> dict[str, Any]:
+    """Open a local folder/file in the OS file manager (dev workbench helper).
+
+    返回 available=false 表示服务端没有桌面环境（云端容器部署的常态），
+    前端据此把「打开目录」降级为「展示并复制路径」，不再显示红色报错。
+    """
+    from pathlib import Path
+
+    from sortie_deck.workspace import (
+        RevealUnavailable,
+        allowed_roots,
+        is_under_allowed,
+        reveal_in_os,
+    )
+
+    raw = (body.path or "").strip()
+    if not raw:
+        raise HTTPException(400, "path required")
+    target = Path(raw).expanduser()
+    cfg = orch().cfg
+    roots = allowed_roots(cfg.data_dir, cfg.data_dir.parent)
+    if not is_under_allowed(target if target.exists() else target.parent, roots):
+        # Allow revealing soon-to-exist dirs under allowed roots
+        if not is_under_allowed(target, roots):
+            raise HTTPException(403, "path outside allowed roots")
+
+    def _unavailable(exc: RevealUnavailable, shown: Path, **extra: Any) -> dict[str, Any]:
+        # 无桌面环境不是服务端故障：返回 200 + 明确原因，交给前端做降级提示
+        return {"ok": False, "available": False, "path": str(shown), "reason": exc.reason, **extra}
+
+    if not target.exists():
+        # Create empty mission dirs so reveal still works early in a run
+        try:
+            if target.suffix:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if not is_under_allowed(target.parent, roots):
+                    raise HTTPException(403, "path outside allowed roots")
+                try:
+                    reveal_in_os(target.parent)
+                except RevealUnavailable as exc:
+                    return _unavailable(exc, target.parent, created=False, missing=True)
+                return {"ok": True, "available": True, "path": str(target.parent), "created": False, "missing": True}
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise HTTPException(400, f"cannot create path: {exc}") from exc
+    try:
+        reveal_in_os(target)
+    except RevealUnavailable as exc:
+        return _unavailable(exc, target)
+    except OSError as exc:
+        raise HTTPException(500, f"reveal failed: {exc}") from exc
+    return {"ok": True, "available": True, "path": str(target.resolve())}
+
+
+async def _mission_event_stream(o: Any, initiative_id: str, *, is_owner: bool):
+    """任务事件流（SSE 的生成器，独立出来便于单测）。
+
+    事件源是持久化事件表（mission 可能跑在 worker 进程，进程内队列跨不过去）：
+    先发快照建立基线，随后按 seq 续读，断线重连不丢事件，也不要求 API 与执行
+    在同一进程。单条事件超体积时只存结构，这里回读 store 补齐快照。
+    """
+    seen_room_ids: set[str] = set()
+    # 基线必须在读快照之前取：宁可重放（前端幂等）也不漏事件。
+    # 重放的聊天消息按 id 去重，避免气泡重复。
+    last_seq = await asyncio.to_thread(o.events.latest_seq, initiative_id)
+    first = o.get(initiative_id)
+    if first is not None:
+        msgs = o.list_room_messages(initiative_id)
+        seen_room_ids = {m.id for m in msgs}
+        yield {"event": "snapshot", "data": json.dumps(first.model_dump(mode="json"))}
+        yield {
+            "event": "room_snapshot",
+            "data": json.dumps([m.model_dump(mode="json") for m in msgs]),
+        }
+    idle = 0.0
+    while True:
+        rows = await asyncio.to_thread(o.events.since, initiative_id, last_seq)
+        if rows:
+            idle = 0.0
+            for seq, event in rows:
+                last_seq = seq
+                if not is_owner and event.get("type") in {"subroom", "subroom_message"}:
+                    continue
+                if event.get("type") == "room_message":
+                    msg_id = str((event.get("message") or {}).get("id") or "")
+                    if msg_id and msg_id in seen_room_ids:
+                        continue
+                    if msg_id:
+                        seen_room_ids.add(msg_id)
+                if event.get("snapshot_omitted"):
+                    fresh = o.get(initiative_id)
+                    if fresh is not None:
+                        event = {**event, "initiative": fresh.model_dump(mode="json")}
+                yield {
+                    "event": event.get("type", "message"),
+                    "data": json.dumps(event, default=str),
+                }
+            continue
+        await asyncio.sleep(0.3)
+        idle += 0.3
+        if idle >= 15.0:
+            idle = 0.0
+            yield {"event": "ping", "data": "{}"}
+
+
+@app.get("/api/initiatives/{initiative_id}/events")
+async def initiative_events(
+    initiative_id: str,
+    token: str | None = Query(default=None),
+    authorization: str | None = Header(default=None),
+) -> EventSourceResponse:
+    user = get_auth().resolve(_bearer(authorization) or token)
+    if not user:
+        raise HTTPException(401, "login required")
+    o = orch()
+    ini = o.get(initiative_id)
+    if not ini:
+        raise HTTPException(404, "Initiative not found")
+    _ensure_mission_access(ini, user)
+
+    # 小群事件只推给任务所有权人：共享用户与 admin 能看任务过程，但不该看到小群
+    is_owner = getattr(ini, "created_by", None) == user.id
+    return EventSourceResponse(_mission_event_stream(o, initiative_id, is_owner=is_owner))
+
+
+def _bridges() -> Any:
+    from sortie_deck.bridges import BridgeStore
+
+    return BridgeStore(settings.bridges_db)
+
+
+@app.get("/api/bridges")
+async def list_bridges(_user: PublicUser = Depends(require_admin)) -> dict[str, Any]:
+    return {"mappings": [m.model_dump() for m in _bridges().list()]}
+
+
+@app.post("/api/bridges/map")
+async def map_bridge(
+    body: dict[str, Any], user: PublicUser = Depends(require_admin)
+) -> dict[str, Any]:
+    from sortie_deck.bridges import PROVIDERS, BridgeMapping
+
+    mapping = BridgeMapping(
+        provider=str(body.get("provider") or ""),
+        channel_id=str(body.get("channel_id") or ""),
+        initiative_id=str(body.get("initiative_id") or ""),
+        label=str(body.get("label") or ""),
+        chat_type=str(body.get("chat_type") or "group"),
+        created_by=user.username,
+    )
+    # 早先这里只放行 slack/feishu，导致 /api/bridges/dingtalk 的入站消息
+    # 永远 resolve 不到映射（配不上也就永远回 "conversation not mapped"）。
+    if (
+        mapping.provider not in PROVIDERS
+        or mapping.chat_type not in {"single", "group"}
+        or not mapping.channel_id
+        or not mapping.initiative_id
+    ):
+        raise HTTPException(
+            400, f"provider must be one of {', '.join(PROVIDERS)}; channel_id and initiative_id required"
+        )
+    if not orch().get(mapping.initiative_id):
+        raise HTTPException(404, "Initiative not found")
+    return _bridges().upsert(mapping).model_dump()
+
+
+@app.post("/api/bridges/slack")
+async def slack_bridge(request: Request) -> dict[str, Any]:
+    from sortie_deck.bridges import slack_text_from_payload, verify_slack_signature
+
+    body = await request.body()
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        payload = json.loads(body.decode("utf-8") or "{}")
+    else:
+        # slash command form-encoded
+        from urllib.parse import parse_qs
+
+        form = {k: v[0] for k, v in parse_qs(body.decode("utf-8")).items()}
+        payload = form
+    if payload.get("type") == "url_verification":
+        return {"challenge": payload.get("challenge")}
+    secret = settings.slack_signing_secret or ""
+    if secret:
+        ok = verify_slack_signature(
+            signing_secret=secret,
+            timestamp=request.headers.get("x-slack-request-timestamp", ""),
+            body=body,
+            signature=request.headers.get("x-slack-signature", ""),
+        )
+        if not ok:
+            raise HTTPException(401, "invalid slack signature")
+    channel, author, text = slack_text_from_payload(payload)
+    if not channel or not text:
+        return {"ok": True, "ignored": True}
+    mapping = _bridges().resolve("slack", channel)
+    if not mapping:
+        return {"ok": False, "error": "channel not mapped"}
+    try:
+        msg, ini = await orch().post_human_message(
+            mapping.initiative_id, text, author_name=author
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(400, str(exc)) from exc
+    return {
+        "ok": True,
+        "message_id": msg.id,
+        "initiative_id": mapping.initiative_id,
+        "status": ini.status.value if ini else None,
+    }
+
+
+@app.post("/api/bridges/feishu")
+async def feishu_bridge(request: Request) -> dict[str, Any]:
+    from sortie_deck.bridges import feishu_text_from_payload
+
+    payload = await request.json()
+    # URL verification
+    if payload.get("type") == "url_verification" or payload.get("challenge"):
+        token = settings.feishu_verification_token
+        if token and payload.get("token") and payload.get("token") != token:
+            raise HTTPException(401, "invalid feishu token")
+        return {"challenge": payload.get("challenge")}
+    channel, author, text = feishu_text_from_payload(payload)
+    if not channel or not text:
+        return {"code": 0, "ignored": True}
+    mapping = _bridges().resolve("feishu", channel)
+    if not mapping:
+        return {"code": 0, "error": "chat not mapped"}
+    try:
+        await orch().post_human_message(mapping.initiative_id, text, author_name=author)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(400, str(exc)) from exc
+    return {"code": 0}
+
+
+@app.post("/api/bridges/dingtalk")
+async def dingtalk_bridge(request: Request) -> dict[str, Any]:
+    from sortie_deck.bridges import dingtalk_text_from_payload
+
+    payload = await request.json()
+    channel, author, text = dingtalk_text_from_payload(payload)
+    if not channel or not text:
+        return {"errcode": 0, "ignored": True}
+    mapping = _bridges().resolve("dingtalk", channel)
+    if not mapping:
+        return {"errcode": 0, "errmsg": "conversation not mapped"}
+    try:
+        await orch().post_human_message(mapping.initiative_id, text, author_name=author)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(400, str(exc)) from exc
+    return {"errcode": 0}
+
+
+@app.get("/api/subrooms")
+async def list_subrooms(
+    initiative_id: str | None = Query(default=None),
+    user: PublicUser = Depends(require_user),
+) -> list[dict[str, Any]]:
+    """Sub-room records (transcripts stay behind their own endpoint).
+
+    仅任务所有权人（created_by）可读：共享用户与 admin 只要不是 owner 一律 403。
+    """
+    from sortie_deck.subroom import get_subroom_service
+
+    service = get_subroom_service()
+    if service is None:
+        return []
+    owned = _owned_mission_ids(user)
+    if initiative_id and initiative_id not in owned:
+        raise HTTPException(403, "小群仅任务创建者可见")
+    rows = service.store.list(initiative_id=initiative_id)
+    return [r.model_dump(mode="json") for r in rows if r.initiative_id in owned]
+
+
+@app.get("/api/subrooms/{subroom_id}/transcript")
+async def get_subroom_transcript(
+    subroom_id: str, user: PublicUser = Depends(require_user)
+) -> list[dict[str, Any]]:
+    from sortie_deck.subroom import get_subroom_service
+
+    service = get_subroom_service()
+    if service is None:
+        raise HTTPException(404, "sub-rooms are not wired")
+    try:
+        sub = service.store.get(subroom_id)
+    except KeyError:
+        raise HTTPException(404, "sub-room not found") from None
+    # 会话正文与列表同口径：非任务所有权人（含共享用户 / admin）不给读
+    if sub.initiative_id not in _owned_mission_ids(user):
+        raise HTTPException(403, "小群仅任务创建者可见")
+    messages = service.transcript(subroom_id)
+    return [m.model_dump(mode="json") for m in messages]
+
+
+class AnswerDecisionRequest(BaseModel):
+    answer: str
+    by: str = ""
+    channel: str = "ui"
+
+
+@app.get("/api/decisions")
+async def list_decisions(
+    initiative_id: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+    _user: PublicUser = Depends(require_user),
+) -> list[dict[str, Any]]:
+    from sortie_deck.decisions import get_decision_service
+
+    service = get_decision_service()
+    if service is None:
+        return []
+    return [
+        d.model_dump(mode="json")
+        for d in service.list(initiative_id=initiative_id, status=status)
+    ]
+
+
+@app.get("/api/decisions/{decision_id}")
+async def get_decision(
+    decision_id: str, _user: PublicUser = Depends(require_user)
+) -> dict[str, Any]:
+    from sortie_deck.decisions import get_decision_service
+
+    service = get_decision_service()
+    if service is None:
+        raise HTTPException(404, "decision centre is not wired")
+    try:
+        return service.get(decision_id).model_dump(mode="json")
+    except KeyError:
+        raise HTTPException(404, "decision not found") from None
+
+
+@app.post("/api/decisions/{decision_id}/answer")
+async def answer_decision(
+    decision_id: str,
+    req: AnswerDecisionRequest,
+    user: PublicUser = Depends(require_user),
+) -> dict[str, Any]:
+    """Record a human answer; idempotent and authorised against the assignee."""
+    outcome = await orch().resolve_decision(
+        decision_id,
+        answer=req.answer,
+        by=req.by or user.display_name,
+        channel=req.channel,
+        is_admin=user.role == "admin",
+    )
+    return outcome.model_dump(mode="json")
+
+
+@app.post("/api/decisions/sweep")
+async def sweep_decisions(_user: PublicUser = Depends(require_user)) -> dict[str, Any]:
+    """Expire overdue decisions and report the fallback that was applied."""
+    expired = await orch().sweep_decisions()
+    return {"expired": [d.model_dump(mode="json") for d in expired]}
+
+
+@app.get("/api/org-policy")
+async def get_org_policy(_user: PublicUser = Depends(require_user)) -> dict[str, Any]:
+    policy = orch().org_policy
+    return {"policy": policy.model_dump() if policy else None}
+
+
+# 前端产物目录：默认按仓库布局推导，容器里用 TDT_WEB_DIST 显式指定
+WEB_DIST = settings.resolved_web_dist
+if WEB_DIST.exists():
+    # slim 镜像里没有 /etc/mime.types，mimetypes 不认识 webp/avif，
+    # StaticFiles 会回 application/octet-stream，浏览器可能不按图片渲染。
+    import mimetypes as _mimetypes
+
+    _mimetypes.add_type("image/webp", ".webp")
+    _mimetypes.add_type("image/avif", ".avif")
+
+    app.mount("/assets", StaticFiles(directory=WEB_DIST / "assets"), name="assets")
+
+    # public/ 目录（Vite 原样拷贝到 dist 根）里的图片与音频：开发态由 Vite 直接服务，
+    # 容器里没人代劳，必须显式挂载。否则这些请求会落到文件末尾 MCP 的根挂载上，
+    # 表现为 img 返回 401、页面 logo 与内置头像全部裂图。
+    for _sub in ("audio", "avatars", "backgrounds", "brand"):
+        _sub_dir = WEB_DIST / _sub
+        if _sub_dir.is_dir():
+            app.mount(f"/{_sub}", StaticFiles(directory=_sub_dir), name=f"public-{_sub}")
+
+    @app.get("/")
+    async def index() -> FileResponse:
+        return FileResponse(WEB_DIST / "index.html")
+
+    # dist 根目录下的单文件（logo.png / favicon 等）。逐个注册而不是用
+    # /{filename} 兜底，避免把单段的 /mcp 等路由一起吃掉。
+    def _root_file_handler(path: Path):
+        async def _serve() -> FileResponse:
+            return FileResponse(path)
+
+        return _serve
+
+    for _name in ("logo.png", "logo2.png", "favicon.ico", "favicon.svg", "robots.txt"):
+        _file = WEB_DIST / _name
+        if _file.is_file():
+            app.get(f"/{_name}", name=f"public-{_name}")(_root_file_handler(_file))
+
+
+# --- IM 集成（工作台「设置 → IM 集成」+ 平台入站）--------------------------
+
+
+def _im() -> Any:
+    """取 IM 栈。未配置主密钥时仍可浏览，但写入会由 store 抛 SecretKeyMissing。"""
+    from sortie_deck.im.service import get_stack
+
+    stack = get_stack()
+    if stack is None:
+        raise HTTPException(503, "IM 栈不可用：请检查 TDT_SECRET_KEY 与启动日志")
+    return stack
+
+
+class ImConnectionBody(BaseModel):
+    provider: str
+    mode: str = "stream"
+    app_id: str = ""
+    secret: str = ""
+    label: str = ""
+
+
+class ImConnectionPatch(BaseModel):
+    label: str | None = None
+    mode: str | None = None
+    app_id: str | None = None
+    secret: str | None = None
+    enabled: bool | None = None
+
+
+@app.get("/api/im/providers")
+async def im_providers(_user: PublicUser = Depends(require_user)) -> dict[str, Any]:
+    """渠道能力表：前端据此渲染卡片与表单，不必硬编码"飞书要 App ID"。"""
+    from sortie_deck.im import provider_catalog
+
+    return {"providers": provider_catalog()}
+
+
+@app.get("/api/im/connections")
+async def im_list(user: PublicUser = Depends(require_user)) -> dict[str, Any]:
+    # 列表本身不含任何明文，成员只读即可（便于值班同学确认"到底接没接上"）
+    _ = user
+    return {"connections": _im().manager.list_public()}
+
+
+@app.post("/api/im/connections")
+async def im_create(
+    body: ImConnectionBody, user: PublicUser = Depends(require_admin)
+) -> dict[str, Any]:
+    from sortie_deck.im.connection import ImConnectionError
+
+    stack = _im()
+    app_id = (body.app_id or "").strip()
+    secret = (body.secret or "").strip() or None
+    if body.provider == "slack" and secret:
+        # Slack 没有「App ID + Secret」：表单两栏是 Bot Token 与 Signing Secret，
+        # 而 Bot Token 本身就是凭据，不能明文落在可回显的 app_id 列。
+        from sortie_deck.im.slack import fold_credentials
+
+        app_id, secret = fold_credentials(app_id, secret)
+    try:
+        conn = stack.store.create(
+            provider=body.provider,
+            mode=body.mode,
+            app_id=app_id,
+            secret=secret,
+            label=body.label,
+            created_by=user.username,
+        )
+    except Exception as exc:  # noqa: BLE001 — 冲突/校验错误直接回给用户
+        raise HTTPException(400, str(exc)) from exc
+
+    # 二维码渠道此时还没有凭据，等扫码成功再探活
+    if conn.mode == "qr":
+        return {"connection": conn.to_public()}
+
+    try:
+        updated = await stack.manager.probe(conn.id)
+    except ImConnectionError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    # 主动拉取型渠道（微信长轮询 / 企微 WS）在探活成功后立即起循环，
+    # 否则会出现"显示已连接但收不到消息"。
+    # 长连接渠道探活后停在 connecting，也要立刻起循环；等首条事件再转 connected
+    if updated.provider in {"wechat", "wecom", "feishu", "dingtalk"} and updated.status in {
+        "connected",
+        "connecting",
+    }:
+        stack.runner.spawn(updated.id, updated.provider)
+    return {"connection": updated.to_public()}
+
+
+@app.patch("/api/im/connections/{conn_id}")
+async def im_update(
+    conn_id: str, body: ImConnectionPatch, _user: PublicUser = Depends(require_admin)
+) -> dict[str, Any]:
+    import sortie_deck.im.connection
+
+    stack = _im()
+    # Slack 改 Signing Secret 时，前端 app_id 栏是空的（Bot Token 不在明文里），
+    # 直接覆盖会把 token 写丢。这里从旧密文补回 token 再合并。
+    if body.secret:
+        current = stack.store.get(conn_id)
+        if current.provider == "slack":
+            from sortie_deck.im.slack import fold_credentials, split_credentials
+
+            old_token, _ = split_credentials(stack.store.decrypt_secret(conn_id))
+            token = (body.app_id or "").strip() or old_token
+            body.app_id, body.secret = fold_credentials(token, body.secret)
+
+    # 换 mode 前先把状态打回 unconfigured：平台侧「长连接 / 回调」互斥，
+    # 不先断开会让旧连接继续占着，表现为"改了设置没生效"。
+    if body.mode is not None:
+        current = stack.store.get(conn_id)
+        if body.mode != current.mode:
+            stack.store.set_status(conn_id, "unconfigured", allow_force=True)
+    try:
+        conn = stack.store.update(
+            conn_id,
+            label=body.label,
+            mode=body.mode,
+            app_id=body.app_id,
+            secret=body.secret,
+            enabled=body.enabled,
+        )
+    except sortie_deck.im.connection.ImConnectionError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"connection": conn.to_public()}
+
+
+@app.delete("/api/im/connections/{conn_id}")
+async def im_delete(conn_id: str, _user: PublicUser = Depends(require_admin)) -> dict[str, Any]:
+    import sortie_deck.im.connection
+
+    stack = _im()
+    provider = stack.manager.providers.get(stack.store.get(conn_id).provider)
+    if provider is not None and hasattr(provider, "detach"):
+        provider.detach(conn_id)
+    # 先停后台循环再删记录，避免循环拿着已删除的 id 反复取记录报错
+    await stack.runner.cancel(conn_id)
+    try:
+        stack.store.delete(conn_id)
+    except sortie_deck.im.connection.ImConnectionError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return {"ok": True}
+
+
+@app.post("/api/im/connections/{conn_id}/probe")
+async def im_probe(conn_id: str, _user: PublicUser = Depends(require_admin)) -> dict[str, Any]:
+    import sortie_deck.im.connection
+
+    stack = _im()
+    try:
+        conn = await stack.manager.probe(conn_id)
+    except sortie_deck.im.connection.ImConnectionError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"connection": conn.to_public()}
+
+
+@app.post("/api/im/connections/wechat/qr")
+async def im_wechat_qr_start(user: PublicUser = Depends(require_admin)) -> dict[str, Any]:
+    """申请微信登录二维码。
+
+    工作区级绑定：已有 wechat 记录就复用它重新扫码（换号/续期），
+    没有则自动建一条 ``mode=qr`` 的待配置记录。
+    """
+    stack = _im()
+    conn = stack.store.get_by_provider("wechat")
+    if conn is None:
+        conn = stack.store.create(provider="wechat", mode="qr", created_by=user.username)
+    try:
+        session = await stack.qr.start(conn.id)
+    except Exception as exc:  # noqa: BLE001 — 平台错误原样回给管理页
+        raise HTTPException(400, str(exc)) from exc
+    return {"conn_id": conn.id, **session.to_public()}
+
+
+@app.get("/api/im/connections/wechat/qr/{ticket}")
+async def im_wechat_qr_poll(ticket: str, _user: PublicUser = Depends(require_user)) -> dict[str, Any]:
+    """轮询扫码状态；``confirmed`` 时立即起长轮询，避免"扫码成功但收不到消息"。"""
+    import sortie_deck.im.connection
+
+    stack = _im()
+    try:
+        session = await stack.qr.poll(ticket)
+    except sortie_deck.im.connection.ImConnectionError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    if session.status == "confirmed":
+        stack.runner.spawn(session.conn_id, "wechat")
+    return session.to_public()
+
+
+@app.get("/api/im/connections/{conn_id}/health")
+async def im_health(conn_id: str, _user: PublicUser = Depends(require_user)) -> dict[str, Any]:
+    import sortie_deck.im.connection
+
+    stack = _im()
+    try:
+        return stack.manager.health(conn_id)
+    except sortie_deck.im.connection.ImConnectionError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.get("/api/im/connections/{conn_id}/chats")
+async def im_chats(conn_id: str, _user: PublicUser = Depends(require_user)) -> dict[str, Any]:
+    """该渠道已绑定的会话（数据源是 bridges 映射表，P2 再补"平台侧会话列表"）。"""
+    stack = _im()
+    conn = stack.store.get(conn_id)
+    rows = [m.model_dump() for m in _bridges().list() if m.provider == conn.provider]
+    return {"chats": rows}
+
+
+async def _slack_webhook(stack: Any, request: Request, raw: bytes) -> Any:
+    """Slack 入站：Events API（JSON）与 Interactivity（form）两套 Content-Type。"""
+    from sortie_deck.im import slack as slack_mod
+
+    conn = stack.store.get_by_provider("slack")
+    if conn is None:
+        raise HTTPException(404, "Slack 尚未配置：请先在「设置 → IM 集成」注册")
+
+    content_type = request.headers.get("content-type", "")
+    if "application/x-www-form-urlencoded" in content_type:
+        form = await request.form()
+        raw_payload = str(form.get("payload") or "")
+        if not raw_payload:
+            raise HTTPException(400, "missing payload")
+        try:
+            payload = json.loads(raw_payload)
+        except json.JSONDecodeError:
+            raise HTTPException(400, "invalid payload json") from None
+    else:
+        try:
+            payload = json.loads(raw.decode("utf-8") or "{}")
+        except json.JSONDecodeError:
+            raise HTTPException(400, "invalid json") from None
+
+    # 签名必须对原始 body 算：form 解析会重编码，拿解析后的值验签永远不匹配
+    secret = stack.store.decrypt_secret(conn.id)
+    ok = slack_mod.verify_slack_signature(
+        signing_secret=slack_mod.signing_secret_of(secret),
+        timestamp=request.headers.get("x-slack-request-timestamp", ""),
+        body=raw,
+        signature=request.headers.get("x-slack-signature", ""),
+    )
+    if not ok:
+        raise HTTPException(401, "invalid slack signature")
+
+    if payload.get("type") == "url_verification":
+        # 地址校验也要过验签：否则任何人都能确认本实例是否为该应用的回调
+        return {"challenge": payload.get("challenge")}
+
+    adapter = stack.manager.providers.get("slack")
+    if adapter is None:
+        raise HTTPException(404, "Slack 渠道未启用")
+    event = adapter.parse_inbound(payload)
+    if event is None:
+        return {"ok": True, "ignored": True}
+    stack.router.schedule(event)
+    return {"ok": True}
+
+
+@app.post("/api/im/webhook/{provider}")
+async def im_webhook(provider: str, request: Request) -> Any:
+    """统一入站入口。
+
+    平台侧窗口：飞书 3s / 钉钉 1.5s / 企微 5s。因此这里只做「解析 + 入队」，
+    业务处理全部交给后台任务，立刻 ACK。
+    """
+    from sortie_deck.im import feishu as feishu_mod
+
+    stack = _im()
+    raw = await request.body()
+
+    # Slack 的按钮回调是 form-encoded（真正的 JSON 在 payload 字段里），
+    # 跟其它平台的纯 JSON body 不是一回事，必须先分流再解析。
+    if provider == "slack":
+        return await _slack_webhook(stack, request, raw)
+
+    try:
+        payload = json.loads(raw.decode("utf-8") or "{}")
+    except json.JSONDecodeError:
+        raise HTTPException(400, "invalid json") from None
+
+    if provider == "feishu":
+        # URL 校验握手（首次配置回调地址时飞书会发一次）
+        if payload.get("type") == "url_verification":
+            return {"challenge": payload.get("challenge")}
+        if payload.get("encrypt"):
+            encrypt_key = settings.feishu_encrypt_key or ""
+            try:
+                payload = feishu_mod.decrypt_payload(encrypt_key, payload["encrypt"])
+            except Exception as exc:  # noqa: BLE001
+                raise HTTPException(401, f"飞书回调解密失败: {exc}") from exc
+        if settings.feishu_encrypt_key:
+            ok = feishu_mod.verify_signature(
+                settings.feishu_encrypt_key,
+                request.headers.get("x-lark-request-timestamp", ""),
+                request.headers.get("x-lark-request-nonce", ""),
+                raw,
+                request.headers.get("x-lark-signature", ""),
+            )
+            if not ok:
+                raise HTTPException(401, "invalid feishu signature")
+
+    adapter = stack.manager.providers.get(provider)
+    if adapter is None:
+        raise HTTPException(404, f"渠道未启用: {provider}")
+    event = adapter.parse_inbound(payload)
+    if event is None:
+        # 非消息类事件（成员变更、URL 校验残留）：ACK 掉即可
+        return {"ok": True, "ignored": True}
+    stack.router.schedule(event)
+    return {"ok": True}
+
+
+@app.post("/api/im/link-code")
+async def im_link_code(user: PublicUser = Depends(require_user)) -> dict[str, Any]:
+    """生成一次性 IM 绑定码。
+
+    用户在工作台生成（此时身份可信），再在 IM 里发 ``/bind <码>`` 完成绑定。
+    反过来不可行：如果允许在 IM 里点一下就把自己绑成某人，等于任何人点一下
+    就能冒充审批人。
+    """
+    from sortie_deck.im.identity import LINK_CODE_TTL
+
+    stack = _im()
+    code, expires_at = stack.link_codes.issue(user_id=user.id, username=user.username)
+    return {
+        "code": code,
+        "expires_at": expires_at,
+        "ttl": int(LINK_CODE_TTL),
+        "instruction": f"在 IM 里发送 /bind {code}",
+    }
+
+
+@app.get("/api/im/identities")
+async def im_identities(
+    provider: str | None = Query(default=None),
+    _user: PublicUser = Depends(require_admin),
+) -> dict[str, Any]:
+    stack = _im()
+    return {"identities": [i.model_dump() for i in stack.identity.list(provider)]}
+
+
+@app.delete("/api/im/identities/{provider}/{sender_id}")
+async def im_unbind_identity(
+    provider: str, sender_id: str, _user: PublicUser = Depends(require_admin)
+) -> dict[str, Any]:
+    stack = _im()
+    if not stack.identity.unbind(provider, sender_id):
+        raise HTTPException(404, "绑定不存在")
+    return {"ok": True}
+
+
+@app.get("/api/im/action")
+async def im_action(
+    d: str = Query(default=""),
+    a: str = Query(default=""),
+    sig: str = Query(default=""),
+) -> Any:
+    """钉钉卡片按钮的落点（钉钉只支持 actionURL，没有按钮回调）。
+
+    这里必须验签：链接可被转发，不签名等于把审批权限变成公开 URL。
+    """
+    from fastapi.responses import HTMLResponse
+
+    from sortie_deck.im.cards import verify_action_signature
+
+    if not d or not a:
+        raise HTTPException(400, "missing decision_id or action")
+    ttl = int(settings.im_action_ttl_seconds or 86400)
+    if not verify_action_signature(settings.resolved_token_secret(), d, a, sig, max_age=ttl):
+        return HTMLResponse(
+            "<h3>链接无效或已过期</h3><p>请到工作台重新处理该审批。</p>", status_code=401
+        )
+    try:
+        outcome = await orch().resolve_decision(
+            d,
+            answer=a,
+            by="dingtalk",
+            channel="im:dingtalk",
+            action=a,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return HTMLResponse(f"<h3>处理失败</h3><p>{exc}</p>", status_code=500)
+    if not getattr(outcome, "accepted", False) and not getattr(outcome, "duplicate", False):
+        reason = getattr(outcome, "reason", "") or "该审批已被处理或你没有权限"
+        return HTMLResponse(f"<h3>未执行</h3><p>{reason}</p>", status_code=403)
+    return HTMLResponse("<h3>已处理</h3><p>可以关闭此页面，回到任务里查看结果。</p>")
+
+
+# ---------------------------------------------------------------------------
+# MCP：Streamable HTTP 服务端（与 API 同进程，共享 Orchestrator 与 data_dir）
+# ---------------------------------------------------------------------------
+
+_mcp_cm_factory: Any = None
+try:
+    from sortie_deck.mcp_server import build_mcp_app
+    from sortie_deck.mcp_server import lifespan_context as _mcp_lifespan_context
+
+    # 挂在根路径、由子应用自带 "/mcp" 路由：Mount("/mcp") 会把 /mcp 307 重定向到
+    # /mcp/，而 MCP 客户端（含 Claude Code）通常不跟随 POST 重定向。
+    _allowed_hosts = [h.strip() for h in (settings.mcp_allowed_hosts or "").split(",") if h.strip()]
+    app.mount("/", build_mcp_app(allowed_hosts=_allowed_hosts or None))
+    _mcp_cm_factory = _mcp_lifespan_context
+    logger.info("MCP Streamable HTTP 已挂载: /mcp（stateless）")
+except Exception as exc:  # noqa: BLE001 — MCP 初始化失败不能拖垮 API
+    logger.warning("MCP 服务端初始化失败（API 仍可用）: %s", exc)
+
+
+@asynccontextmanager
+async def _lifespan_with_mcp(app_instance: FastAPI):
+    """把 MCP 子应用的 lifespan 挂进父应用。
+
+    Starlette 的 Mount 不会自动运行子应用 lifespan；不代为进入的话
+    session manager 不会启动，所有 MCP 请求都会失败。
+    """
+    if _mcp_cm_factory is None:
+        async with lifespan(app_instance):
+            yield
+        return
+    async with _mcp_cm_factory(), lifespan(app_instance):
+        yield
+
+
+app.router.lifespan_context = _lifespan_with_mcp
+
+
+def run() -> None:
+    import uvicorn
+
+    uvicorn.run(
+        "sortie_deck.api.app:app",
+        host=settings.host,
+        port=settings.port,
+        reload=False,
+    )
+
+
+if __name__ == "__main__":
+    run()
